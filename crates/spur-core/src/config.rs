@@ -1542,6 +1542,17 @@ pub struct HealthConfig {
     /// nodes (`"10%"`, rounded up, at least 1); `"0"` or `"0%"` disables the cap.
     #[serde(default = "default_health_max_unavailable")]
     pub max_unavailable: String,
+    /// Controller-side script triggered after a health check drains a node.
+    /// Receives `SPUR_HEALTH_NODE`, `SPUR_HEALTH_CHECK_PROGRAM`,
+    /// `SPUR_HEALTH_EXIT_CODE`, `SPUR_HEALTH_JOB_STATE`, and
+    /// `SPUR_HEALTH_DRAIN_REASON` as environment variables. Exit 0 auto-resumes
+    /// the node so the next health check re-validates it; non-zero or timeout
+    /// leaves the node drained for operator intervention. `None` = disabled.
+    #[serde(default)]
+    pub remediation_program: Option<String>,
+    /// Kill the remediation script after this many seconds.
+    #[serde(default = "default_remediation_timeout")]
+    pub remediation_timeout_secs: u64,
 }
 
 impl Default for HealthConfig {
@@ -1549,6 +1560,8 @@ impl Default for HealthConfig {
         Self {
             checks: Vec::new(),
             max_unavailable: default_health_max_unavailable(),
+            remediation_program: None,
+            remediation_timeout_secs: default_remediation_timeout(),
         }
     }
 }
@@ -1618,6 +1631,10 @@ fn default_health_max_wait() -> u64 {
 
 fn default_health_max_unavailable() -> String {
     "10%".to_string()
+}
+
+fn default_remediation_timeout() -> u64 {
+    300
 }
 
 /// Parse a `max_unavailable` value ("5" or "10%") against the eligible-node
@@ -2084,6 +2101,14 @@ impl SlurmConfig {
                     self.health.max_unavailable
                 ),
             });
+        }
+        if let Some(ref prog) = self.health.remediation_program {
+            if !Path::new(prog).is_absolute() {
+                return Err(ConfigError::InvalidValue {
+                    field: "health.remediation_program".into(),
+                    value: format!("{prog:?} (must be an absolute path)"),
+                });
+            }
         }
         Ok(())
     }
@@ -3233,6 +3258,40 @@ gid = 0
         .unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidValue { field, .. } if field == "health.max_unavailable")
+        );
+    }
+
+    #[test]
+    fn test_health_remediation_defaults() {
+        let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
+        assert!(config.health.remediation_program.is_none());
+        assert_eq!(config.health.remediation_timeout_secs, 300);
+    }
+
+    #[test]
+    fn test_health_remediation_parses() {
+        let toml = r#"
+cluster_name = "x"
+[health]
+remediation_program = "/etc/spur/remediate.sh"
+remediation_timeout_secs = 120
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(
+            config.health.remediation_program.as_deref(),
+            Some("/etc/spur/remediate.sh")
+        );
+        assert_eq!(config.health.remediation_timeout_secs, 120);
+    }
+
+    #[test]
+    fn test_health_remediation_rejects_relative_path() {
+        let err = SlurmConfig::load_from_str(
+            "cluster_name = \"x\"\n[health]\nremediation_program = \"remediate.sh\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidValue { field, .. } if field == "health.remediation_program")
         );
     }
 

@@ -454,6 +454,10 @@ pub struct ClusterManager {
     /// from the durable job store / node reasons instead, so they survive
     /// failover.
     health_last_check: parking_lot::Mutex<HashMap<(usize, String), std::time::Instant>>,
+    /// Nodes whose remediation hook exited 0. The next health pass auto-resumes
+    /// them (if they still carry the health-check drain) so the next check can
+    /// re-validate. Leader-local and transient.
+    pending_remediation_resumes: Arc<parking_lot::Mutex<HashSet<String>>>,
 }
 
 /// Reserved job-name prefix marking a controller-submitted health-check job, so
@@ -573,6 +577,7 @@ impl ClusterManager {
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
+            pending_remediation_resumes: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -1924,6 +1929,28 @@ impl ClusterManager {
     /// the node keeps running user jobs, the node is soft-drained so it empties,
     /// then resumed so the pending check can land.
     pub fn run_node_health_pass(&self) {
+        let to_resume: Vec<String> = self.pending_remediation_resumes.lock().drain().collect();
+        for node_name in to_resume {
+            if let Some(n) = self.get_node(&node_name) {
+                let is_health_drained = matches!(
+                    n.state,
+                    NodeState::Drain | NodeState::Draining
+                ) && n
+                    .state_reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with(HEALTH_FAIL_DRAIN_PREFIX));
+                if is_health_drained {
+                    if let Err(e) =
+                        self.update_node_state(&node_name, NodeState::Idle, None, None)
+                    {
+                        warn!(node = %node_name, error = %e, "remediation succeeded but failed to resume node");
+                    } else {
+                        info!(node = %node_name, "remediation auto-resumed node for re-test");
+                    }
+                }
+            }
+        }
+
         let config = self.config();
         if config.health.checks.is_empty() {
             return;
@@ -2155,12 +2182,54 @@ impl ClusterManager {
         if failed {
             let reason =
                 format!("{HEALTH_FAIL_DRAIN_PREFIX}{program} failed ({state:?}, exit {exit_code})");
-            if let Err(e) = self.drain_node(&node, Some(reason), None) {
+            if let Err(e) = self.drain_node(&node, Some(reason.clone()), None) {
                 warn!(node = %node, error = %e, "failed to drain node after failing health check");
             }
+            self.spawn_remediation_hook(&node, &program, exit_code, state, &reason);
         }
         // Passed/Cancelled/Preempted: leave the node as-is. A force-drained node
         // was already resumed by the pass before the check could run.
+    }
+
+    fn spawn_remediation_hook(
+        &self,
+        node: &str,
+        check_program: &str,
+        exit_code: i32,
+        state: JobState,
+        drain_reason: &str,
+    ) {
+        let config = self.config();
+        let Some(ref script) = config.health.remediation_program else {
+            return;
+        };
+        let script = script.clone();
+        let timeout = config.health.remediation_timeout_secs;
+        let ctx = spur_core::hooks::RemediationContext {
+            node: node.to_string(),
+            check_program: check_program.to_string(),
+            exit_code,
+            job_state: format!("{state:?}"),
+            drain_reason: drain_reason.to_string(),
+        };
+        let resume_set = self.pending_remediation_resumes.clone();
+        let notify = self.scheduler_notify.clone();
+        tokio::spawn(async move {
+            match spur_core::hooks::run_remediation_hook(&script, timeout, &ctx).await {
+                Ok(true) => {
+                    resume_set.lock().insert(ctx.node.clone());
+                    notify.notify_one();
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(
+                        node = %ctx.node,
+                        error = %e,
+                        "remediation hook failed — node stays drained"
+                    );
+                }
+            }
+        });
     }
 
     fn run_epilog_slurmctld(&self, job_id: JobId) {

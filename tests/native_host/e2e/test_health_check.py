@@ -28,6 +28,14 @@ CONDITIONAL_HEALTH = (
     "if [ -f {RD}/unhealthy ]; then echo 'degraded' >&2; exit 1; fi\n"
     "exit 0\n"
 )
+# Remediation script that removes the unhealthy marker and exits 0 (success),
+# triggering auto-resume so the next health check re-validates the node.
+REMEDIATE_FIX = (
+    "#!/bin/bash\n"
+    "rm -f {RD}/unhealthy\n"
+    "exit 0\n"
+)
+REMEDIATE_FAIL = "#!/bin/bash\nexit 1\n"
 
 
 def _health_overrides(cluster, body: str, **check_kw) -> dict:
@@ -261,3 +269,43 @@ class TestHealthCheck:
         # The failing second check drains the node — so it ran, independently of
         # the passing first check.
         _wait_node_drained(cluster, target)
+
+    def test_remediation_auto_resumes_after_fix(self, unstarted_cluster):
+        cluster = unstarted_cluster
+        rd = cluster.remote_dir
+        cluster.write_file(
+            "health/remediate.sh",
+            REMEDIATE_FIX.replace("{RD}", rd),
+            all_nodes=True,
+        )
+        overrides = _health_overrides(cluster, CONDITIONAL_HEALTH, interval_secs=3)
+        overrides["health"]["remediation_program"] = f"{rd}/health/remediate.sh"
+        overrides["health"]["remediation_timeout_secs"] = 30
+        cluster.start(overrides)
+        target = cluster.node_names[0]
+
+        # Flip the node unhealthy: the check fails and drains it.
+        cluster.nodes[0].exec(f"touch {rd}/unhealthy")
+        _wait_node_drained(cluster, target)
+
+        # The remediation hook removes the marker and exits 0, so the controller
+        # auto-resumes the node. The next health check re-validates it (passes
+        # because the marker is gone) and the node stays schedulable.
+        _wait_node_not_drained(cluster, target, timeout=45)
+
+    def test_failed_remediation_keeps_node_drained(self, unstarted_cluster):
+        cluster = unstarted_cluster
+        rd = cluster.remote_dir
+        cluster.write_file("health/remediate-fail.sh", REMEDIATE_FAIL, all_nodes=True)
+        overrides = _health_overrides(cluster, FAILING_HEALTH, interval_secs=3)
+        overrides["health"]["remediation_program"] = f"{rd}/health/remediate-fail.sh"
+        overrides["health"]["remediation_timeout_secs"] = 10
+        cluster.start(overrides)
+        target = cluster.node_names[0]
+
+        _wait_node_drained(cluster, target)
+        # The remediation exits non-zero, so the node must stay drained.
+        time.sleep(10)
+        assert cluster.sinfo_nodes().get(target, "").lower().startswith("drain"), (
+            "a failed remediation must leave the node drained"
+        )

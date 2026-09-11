@@ -106,6 +106,81 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
     Ok(())
 }
 
+/// Context for a health-check remediation hook invocation.
+pub struct RemediationContext {
+    pub node: String,
+    pub check_program: String,
+    pub exit_code: i32,
+    pub job_state: String,
+    pub drain_reason: String,
+}
+
+const REMEDIATION_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Run the remediation script on the controller after a health check drains a
+/// node. Returns `Ok(true)` when the script exits 0 (remediation succeeded,
+/// caller should auto-resume), `Ok(false)` on non-zero exit, and `Err` on
+/// launch failure or timeout.
+pub async fn run_remediation_hook(
+    script_path: &str,
+    timeout_secs: u64,
+    ctx: &RemediationContext,
+) -> anyhow::Result<bool> {
+    info!(
+        node = %ctx.node,
+        check = %ctx.check_program,
+        script = script_path,
+        "running remediation hook"
+    );
+
+    let mut env = SpurEnv::new();
+    env.set("SPUR_HEALTH_NODE", &ctx.node);
+    env.set("SPUR_HEALTH_CHECK_PROGRAM", &ctx.check_program);
+    env.set("SPUR_HEALTH_EXIT_CODE", ctx.exit_code);
+    env.set("SPUR_HEALTH_JOB_STATE", &ctx.job_state);
+    env.set("SPUR_HEALTH_DRAIN_REASON", &ctx.drain_reason);
+
+    let mut cmd = Command::new(script_path);
+    for (k, v) in env.into_map() {
+        cmd.env(k, v);
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.current_dir("/tmp");
+
+    let child = cmd
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("remediation script failed to execute: {script_path}"))?;
+
+    let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => anyhow::bail!("remediation script failed to complete: {e}"),
+        Err(_) => anyhow::bail!(
+            "remediation script timed out after {timeout_secs}s: {script_path}"
+        ),
+    };
+
+    let stderr = String::from_utf8_lossy(
+        &output.stderr[..output.stderr.len().min(REMEDIATION_MAX_OUTPUT_BYTES)],
+    );
+    for line in stderr.lines() {
+        warn!(node = %ctx.node, hook = "remediation", "{}", line);
+    }
+
+    if output.status.success() {
+        info!(node = %ctx.node, "remediation succeeded — node will be auto-resumed for re-test");
+        Ok(true)
+    } else {
+        warn!(
+            node = %ctx.node,
+            exit = %output.status,
+            "remediation failed — node stays drained for operator intervention"
+        );
+        Ok(false)
+    }
+}
+
 /// Context for the job-submission hook. Feeds env twins and the audit line;
 /// `spec_json` is the fully-resolved spec sent to the script on stdin.
 pub struct SubmitHookContext {
