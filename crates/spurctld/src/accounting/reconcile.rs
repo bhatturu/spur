@@ -234,10 +234,7 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
             num_nodes: spec.num_nodes,
             num_tasks: spec.num_tasks,
             cpus_per_task: spec.cpus_per_task,
-            gpus_per_task: {
-                let total = spur_core::job::effective_gpus(spec, spec.num_nodes);
-                if spec.num_tasks > 0 { (total / spec.num_tasks as u64) as u32 } else { 0 }
-            },
+            total_gpus: spur_core::job::effective_gpus(spec, spec.num_nodes) as u32,
             memory_mb,
             submit_time: job.submit_time,
             start_time,
@@ -609,7 +606,7 @@ mod tests {
                     num_nodes: job.spec.num_nodes,
                     num_tasks: job.spec.num_tasks,
                     cpus_per_task: job.spec.cpus_per_task,
-                    gpus_per_task: 0,
+                    total_gpus: 0,
                     memory_mb: 0,
                     submit_time: job.submit_time,
                     start_time: job.start_time.unwrap(),

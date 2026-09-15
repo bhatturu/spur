@@ -166,7 +166,13 @@ ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempted_by BIGINT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_mode TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS preempt_qos TEXT NOT NULL DEFAULT '';
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS gpus_per_task INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS total_gpus INTEGER NOT NULL DEFAULT 0;
+-- Rename from prior schema version if it exists.
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='jobs' AND column_name='gpus_per_task') THEN
+    ALTER TABLE jobs RENAME COLUMN gpus_per_task TO total_gpus;
+  END IF;
+END $$;
 
 -- job_id is u32 but these columns were INTEGER, so ids above i32::MAX wrapped negative onto
 -- unrelated rows. Guarded: ALTER TYPE rewrites the table under ACCESS EXCLUSIVE.
@@ -260,7 +266,7 @@ pub struct JobStartRecord {
     pub num_nodes: u32,
     pub num_tasks: u32,
     pub cpus_per_task: u32,
-    pub gpus_per_task: u32,
+    pub total_gpus: u32,
     pub memory_mb: u64,
     pub submit_time: DateTime<Utc>,
     pub start_time: DateTime<Utc>,
@@ -278,7 +284,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, gpus_per_task, memory_mb, submit_time, start_time, state, reservation)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, total_gpus, memory_mb, submit_time, start_time, state, reservation)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'RUNNING', $14)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
@@ -289,7 +295,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             num_nodes = EXCLUDED.num_nodes,
             num_tasks = EXCLUDED.num_tasks,
             cpus_per_task = EXCLUDED.cpus_per_task,
-            gpus_per_task = EXCLUDED.gpus_per_task,
+            total_gpus = EXCLUDED.total_gpus,
             memory_mb = EXCLUDED.memory_mb,
             submit_time = EXCLUDED.submit_time,
             start_time = EXCLUDED.start_time,
@@ -309,7 +315,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     .bind(rec.num_nodes as i32)
     .bind(rec.num_tasks as i32)
     .bind(rec.cpus_per_task as i32)
-    .bind(rec.gpus_per_task as i32)
+    .bind(rec.total_gpus as i32)
     .bind(rec.memory_mb as i64)
     .bind(rec.submit_time)
     .bind(rec.start_time)
@@ -320,7 +326,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // If end_time is already set, the end notification arrived first and skipped
     // usage computation (start_time was NULL at that point). Compute it now.
     let row = sqlx::query(
-        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, gpus_per_task, qos, end_time FROM jobs WHERE job_id = $1",
+        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, end_time FROM jobs WHERE job_id = $1",
     )
     .bind(rec.job_id as i64)
     .fetch_one(&mut *conn)
@@ -364,7 +370,7 @@ pub async fn record_job_end(
             preempted_by = $7,
             preempt_mode = $8,
             preempt_qos = $9
-        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, gpus_per_task, qos
+        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos
         "#,
     )
     .bind(job_id as i64)
@@ -440,19 +446,19 @@ async fn update_usage(
     };
     let num_tasks: i32 = row.get("num_tasks");
     let cpus_per_task: i32 = row.get("cpus_per_task");
-    let gpus_per_task: i32 = row.try_get("gpus_per_task").unwrap_or(0);
-    let qos_name: String = row.try_get("qos").unwrap_or_default();
+    let total_gpus: i32 = row.get("total_gpus");
+    let qos_name: String = row.get("qos");
 
     let duration_secs = (end_time - start_time).num_seconds().max(0);
     let cpu_seconds = duration_secs * (num_tasks as i64) * (cpus_per_task as i64);
-    let gpu_seconds = duration_secs * (num_tasks as i64) * (gpus_per_task as i64);
+    let gpu_seconds = duration_secs * (total_gpus as i64);
 
     let usage_factor: f64 = if !qos_name.is_empty() {
         sqlx::query_scalar("SELECT usage_factor FROM qos WHERE name = $1")
             .bind(&qos_name)
             .fetch_optional(&mut *conn)
             .await?
-            .map(|v: f32| v as f64)
+            .map(|v: f32| (v as f64).max(0.0))
             .unwrap_or(1.0)
     } else {
         1.0
@@ -1572,7 +1578,7 @@ mod job_history_tests {
                 num_nodes: num_nodes as u32,
                 num_tasks: num_tasks as u32,
                 cpus_per_task: cpus_per_task as u32,
-                gpus_per_task: 0,
+                total_gpus: 0,
                 memory_mb: memory_mb as u64,
                 submit_time,
                 start_time,
@@ -1629,7 +1635,7 @@ mod job_history_tests {
                 num_nodes: 1,
                 num_tasks: 1,
                 cpus_per_task: 1,
-                gpus_per_task: 0,
+                total_gpus: 0,
                 memory_mb: 0,
                 submit_time: start_time,
                 start_time,

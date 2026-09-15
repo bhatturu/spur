@@ -7,6 +7,8 @@ use chrono::{DateTime, Duration, Utc};
 
 use super::db::UsageRecord;
 
+/// Compute per-(user, account) fair-share factors using hierarchical BFS shares,
+/// per-user association weights, and decay-weighted CPU+GPU billable usage.
 pub(super) fn compute_fairshare(
     usage: &[UsageRecord],
     accounts: &[super::db::AccountRecord],
@@ -57,6 +59,9 @@ pub(super) fn compute_fairshare(
     for (account, users) in &users_per_account {
         let account_share = effective_shares.get(account).copied().unwrap_or(0.0);
         if account_share <= 0.0 {
+            for user in users {
+                user_shares.insert((user.clone(), account.clone()), 0.0);
+            }
             continue;
         }
 
@@ -96,6 +101,8 @@ pub(super) fn compute_fairshare(
     factors
 }
 
+/// BFS from root accounts, splitting parent share proportionally by sibling weight.
+/// Accounts whose parent is missing from the list are silently excluded.
 fn build_effective_shares(accounts: &[super::db::AccountRecord]) -> HashMap<String, f64> {
     let weight_map: HashMap<&str, i32> = accounts
         .iter()

@@ -203,7 +203,7 @@ impl SlurmAccounting for AccountingService {
                 num_nodes: 1, // simplified
                 num_tasks: cpus,
                 cpus_per_task: 1,
-                gpus_per_task: 0,
+                total_gpus: 0,
                 memory_mb,
                 submit_time,
                 start_time,

@@ -88,7 +88,6 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         .context("failed to get usage")?;
     let usage = usage_resp.into_inner();
 
-    // Get fairshare factors from the server
     let fairshare_resp = client
         .get_fairshare_factors(GetFairshareFactorsRequest { halflife_days: 0 })
         .await
@@ -185,13 +184,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         let fair_share = account_fairshare
             .get(account.name.as_str())
             .copied()
-            .unwrap_or_else(|| {
-                if norm_usage > 0.001 {
-                    (norm_shares / norm_usage).min(10.0)
-                } else {
-                    (norm_shares / 0.001).min(10.0)
-                }
-            });
+            .unwrap_or(1.0);
 
         let cpu_raw = account_cpu_hours
             .get(account.name.as_str())
@@ -244,13 +237,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             let user_fair_share = fairshare_map
                 .get(&(user.name.clone(), account.name.clone()))
                 .copied()
-                .unwrap_or_else(|| {
-                    if user_norm_usage > 0.001 {
-                        (user_norm_shares / user_norm_usage).min(10.0)
-                    } else {
-                        (user_norm_shares / 0.001).min(10.0)
-                    }
-                });
+                .unwrap_or(1.0);
 
             let user_cpu = user_account_cpu_hours
                 .get(&(user.name.as_str(), account.name.as_str()))

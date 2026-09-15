@@ -1637,12 +1637,6 @@ impl ClusterManager {
         }
 
         if let Some(ref notifier) = *self.accounting.read() {
-            let total_gpus = effective_gpus(&spec_for_notify, spec_for_notify.num_nodes);
-            let gpus_per_task = if spec_for_notify.num_tasks > 0 {
-                (total_gpus / spec_for_notify.num_tasks as u64) as u32
-            } else {
-                0
-            };
             notifier.notify_job_start(JobStartRecord {
                 job_id,
                 name: spec_for_notify.name.clone(),
@@ -1653,7 +1647,7 @@ impl ClusterManager {
                 num_nodes: spec_for_notify.num_nodes,
                 num_tasks: spec_for_notify.num_tasks,
                 cpus_per_task: spec_for_notify.cpus_per_task,
-                gpus_per_task,
+                total_gpus: effective_gpus(&spec_for_notify, spec_for_notify.num_nodes) as u32,
                 memory_mb: resources.memory_mb,
                 submit_time: submit_time_for_notify,
                 start_time: Utc::now(),
