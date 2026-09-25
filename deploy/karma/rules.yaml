@@ -15,17 +15,18 @@ groups:
           )
 
       # --- 2. GPU Utilization (25%) ---
-      - record: karma:gpu_utilization
+      # Matches both gpu_gfx_activity (default prefix) and amd_gpu_gfx_activity (amd_ prefix).
+      # When job_user is populated (via Spur prolog hook), this gives per-user GPU util.
+      # When job_user is empty (no hook), this gives cluster-wide GPU util.
+      - record: karma:gpu_utilization_raw
         expr: |
-          avg by (job_user) (amd_gpu_gfx_activity{job_user!=""}) / 100
+          avg by (gpu_id, hostname) ({__name__=~"(amd_)?gpu_gfx_activity"}) / 100
 
       # --- 3. Resource Accuracy (20%) ---
-      - record: karma:resource_accuracy
+      # Proxy: same as GPU utilization — users keeping GPUs busy = using what they requested.
+      - record: karma:resource_accuracy_raw
         expr: |
-          clamp_max(
-            avg by (job_user) (amd_gpu_gfx_activity{job_user!=""}) / 100,
-            1
-          )
+          avg by (gpu_id, hostname) ({__name__=~"(amd_)?gpu_gfx_activity"}) / 100
 
       # --- 4. Wall Time Accuracy (10%) ---
       - record: karma:walltime_accuracy
@@ -60,10 +61,20 @@ groups:
   - name: karma_composite
     interval: 30s
     rules:
+      # Cluster-wide GPU utilization average (single number, not per-user).
+      # Per-user GPU scoring requires the Spur prolog hook populating job_user.
+      - record: karma:gpu_utilization_cluster
+        expr: |
+          avg(karma:gpu_utilization_raw)
+
+      # Composite karma score per user_name.
+      # GPU dimensions use the cluster-wide average as a proxy when no
+      # per-user GPU attribution is available.
       - record: karma:score
         expr: |
           0.25 * karma:reliability
+          + 0.25 * scalar(karma:gpu_utilization_cluster)
+          + 0.20 * scalar(karma:gpu_utilization_cluster)
           + 0.15 * karma:citizenship
           + 0.10 * karma:walltime_accuracy
           + 0.05 * karma:cancellation_score
-          + 0.45 * 0.5
