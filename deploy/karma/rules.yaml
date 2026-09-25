@@ -1,0 +1,69 @@
+# Prometheus recording rules for karma sub-scores and composite.
+# All sub-scores output only {user_name} to enable clean arithmetic in the composite.
+
+groups:
+  - name: karma_subscores
+    interval: 30s
+    rules:
+      # --- 1. Reliability (25%) ---
+      - record: karma:reliability
+        expr: |
+          sum by (user_name) (spur_karma_jobs_by_state_job_count{state="COMPLETED"})
+          / (
+            sum by (user_name) (spur_karma_jobs_by_state_job_count{state="COMPLETED"})
+            + sum by (user_name) (spur_karma_jobs_by_state_job_count{state=~"FAILED|TIMEOUT|DEADLINE|OUT_OF_MEMORY"})
+          )
+
+      # --- 2. GPU Utilization (25%) ---
+      - record: karma:gpu_utilization
+        expr: |
+          avg by (job_user) (amd_gpu_gfx_activity{job_user!=""}) / 100
+
+      # --- 3. Resource Accuracy (20%) ---
+      - record: karma:resource_accuracy
+        expr: |
+          clamp_max(
+            avg by (job_user) (amd_gpu_gfx_activity{job_user!=""}) / 100,
+            1
+          )
+
+      # --- 4. Wall Time Accuracy (10%) ---
+      - record: karma:walltime_accuracy
+        expr: |
+          clamp_max(
+            clamp_min(
+              sum by (user_name) (spur_karma_walltime_actual_seconds)
+              / sum by (user_name) (spur_karma_walltime_requested_seconds > 0),
+              0
+            ),
+            1
+          )
+
+      # --- 5. Citizenship (15%) ---
+      - record: karma:citizenship
+        expr: |
+          1 - (
+            sum by (user_name) (spur_karma_idle_fill_overflow_count)
+            / sum by (user_name) (spur_karma_idle_fill_total_count > 0)
+          )
+
+      # --- 6. Cancellation Rate (5%) ---
+      - record: karma:cancellation_rate
+        expr: |
+          sum by (user_name) (spur_karma_jobs_by_state_job_count{state="CANCELLED"})
+          / on(user_name) group_left() sum by (user_name) (spur_karma_jobs_submitted_total_submitted)
+
+      - record: karma:cancellation_score
+        expr: |
+          1 - (karma:cancellation_rate or karma:reliability * 0)
+
+  - name: karma_composite
+    interval: 30s
+    rules:
+      - record: karma:score
+        expr: |
+          0.25 * karma:reliability
+          + 0.15 * karma:citizenship
+          + 0.10 * karma:walltime_accuracy
+          + 0.05 * karma:cancellation_score
+          + 0.45 * 0.5

@@ -1923,6 +1923,7 @@ impl ClusterManager {
                 start_time: Utc::now(),
                 reservation: spec_for_notify.reservation.clone(),
                 idle_fill,
+                total_gpus: effective_gpus(&spec_for_notify, spec_for_notify.num_nodes) as u32,
                 time_limit_min: spec_for_notify
                     .time_limit
                     .map(|d| d.num_minutes() as i32),

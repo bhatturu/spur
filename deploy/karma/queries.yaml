@@ -1,0 +1,91 @@
+# Karma score SQL queries for postgres_exporter.
+# Point postgres_exporter at Spur's accounting DB with:
+#   --extend.query-path=/etc/spur/karma-queries.yaml
+#
+# All queries use a 30-day rolling window. Scrape interval should be 5m.
+
+spur_karma_jobs_by_state:
+  query: |
+    SELECT user_name,
+           state,
+           COUNT(*)::float AS job_count
+    FROM jobs
+    WHERE end_time > NOW() - INTERVAL '30 days'
+      AND state IN ('COMPLETED','FAILED','CANCELLED','TIMEOUT',
+                    'NODE_FAIL','DEADLINE','OUT_OF_MEMORY','PREEMPTED')
+    GROUP BY user_name, state
+  metrics:
+    - user_name:
+        usage: "LABEL"
+    - state:
+        usage: "LABEL"
+    - job_count:
+        usage: "GAUGE"
+        description: "Terminal jobs by user and state (30d rolling)"
+
+spur_karma_jobs_submitted:
+  query: |
+    SELECT user_name,
+           COUNT(*)::float AS total_submitted
+    FROM jobs
+    WHERE submit_time > NOW() - INTERVAL '30 days'
+    GROUP BY user_name
+  metrics:
+    - user_name:
+        usage: "LABEL"
+    - total_submitted:
+        usage: "GAUGE"
+        description: "Total jobs submitted by user (30d rolling)"
+
+spur_karma_gpus_requested:
+  query: |
+    SELECT user_name,
+           SUM(total_gpus)::float AS gpus_requested
+    FROM jobs
+    WHERE submit_time > NOW() - INTERVAL '30 days'
+      AND total_gpus > 0
+    GROUP BY user_name
+  metrics:
+    - user_name:
+        usage: "LABEL"
+    - gpus_requested:
+        usage: "GAUGE"
+        description: "Total GPUs requested by user (30d rolling)"
+
+spur_karma_walltime:
+  query: |
+    SELECT user_name,
+           SUM(COALESCE(time_limit_min, 0) * 60)::float AS requested_seconds,
+           SUM(EXTRACT(EPOCH FROM (end_time - start_time)))::float AS actual_seconds
+    FROM jobs
+    WHERE end_time > NOW() - INTERVAL '30 days'
+      AND start_time IS NOT NULL
+      AND end_time IS NOT NULL
+    GROUP BY user_name
+  metrics:
+    - user_name:
+        usage: "LABEL"
+    - requested_seconds:
+        usage: "GAUGE"
+        description: "Total wall time requested in seconds (30d)"
+    - actual_seconds:
+        usage: "GAUGE"
+        description: "Total wall time used in seconds (30d)"
+
+spur_karma_idle_fill:
+  query: |
+    SELECT user_name,
+           COUNT(*) FILTER (WHERE idle_fill)::float AS overflow_count,
+           COUNT(*)::float AS total_count
+    FROM jobs
+    WHERE end_time > NOW() - INTERVAL '30 days'
+    GROUP BY user_name
+  metrics:
+    - user_name:
+        usage: "LABEL"
+    - overflow_count:
+        usage: "GAUGE"
+        description: "Jobs that ran on borrowed capacity (30d)"
+    - total_count:
+        usage: "GAUGE"
+        description: "Total terminal jobs (30d)"

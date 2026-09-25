@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: mirror.gcr.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: spur
+      POSTGRES_PASSWORD: spur
+      POSTGRES_DB: spur
+    ports:
+      - "15432:5432"
+    volumes:
+      - ./seed.sql:/docker-entrypoint-initdb.d/seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spur"]
+      interval: 2s
+      retries: 10
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.16.0
+    environment:
+      DATA_SOURCE_NAME: "postgresql://spur:spur@postgres:5432/spur?sslmode=disable"
+    ports:
+      - "9187:9187"
+    volumes:
+      - ./queries.yaml:/queries.yaml
+    command:
+      - "--extend.query-path=/queries.yaml"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yaml:/etc/prometheus/prometheus.yml
+      - ./rules.yaml:/etc/prometheus/karma-rules.yaml
+    depends_on:
+      - postgres-exporter
