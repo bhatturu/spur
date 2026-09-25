@@ -3950,6 +3950,88 @@ mod job_history_tests {
             .await?;
         Ok(())
     }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn time_limit_min_round_trips_through_db() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let timed = test_job_id(90);
+        let unlimited = test_job_id(91);
+        delete_jobs(&pool, &[timed, unlimited]).await?;
+        let now = Utc::now();
+
+        let mut conn = pool.acquire().await?;
+        record_job_start(
+            &mut conn,
+            &JobStartRecord {
+                job_id: timed,
+                name: "timed".to_string(),
+                user: "karma-test".to_string(),
+                account: String::new(),
+                partition: String::new(),
+                qos: String::new(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                memory_mb: 0,
+                submit_time: now,
+                start_time: now,
+                reservation: None,
+                idle_fill: false,
+                time_limit_min: Some(30),
+            },
+        )
+        .await?;
+        drop(conn);
+
+        let mut conn = pool.acquire().await?;
+        record_job_start(
+            &mut conn,
+            &JobStartRecord {
+                job_id: unlimited,
+                name: "unlimited".to_string(),
+                user: "karma-test".to_string(),
+                account: String::new(),
+                partition: String::new(),
+                qos: String::new(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                memory_mb: 0,
+                submit_time: now,
+                start_time: now,
+                reservation: None,
+                idle_fill: false,
+                time_limit_min: None,
+            },
+        )
+        .await?;
+        drop(conn);
+
+        let records = get_job_history(
+            &pool,
+            &JobHistoryQuery {
+                user: Some("karma-test"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let rec_timed = records.iter().find(|r| r.job_id == timed).unwrap();
+        let rec_unlimited = records.iter().find(|r| r.job_id == unlimited).unwrap();
+
+        assert_eq!(rec_timed.time_limit_min, Some(30));
+        assert_eq!(rec_unlimited.time_limit_min, None);
+
+        let raw: Option<i32> =
+            sqlx::query_scalar("SELECT time_limit_min FROM jobs WHERE job_id = $1")
+                .bind(timed as i64)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(raw, Some(30));
+
+        delete_jobs(&pool, &[timed, unlimited]).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
