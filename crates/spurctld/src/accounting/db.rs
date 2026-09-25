@@ -271,6 +271,8 @@ pub struct JobStartRecord {
     /// can tell which runs were opportunistic, and read back when the run ends to
     /// decide whether fairshare should be charged for it.
     pub idle_fill: bool,
+    /// Wall-clock time limit the user requested, in minutes. `None` when unlimited.
+    pub time_limit_min: Option<i32>,
 }
 
 /// Record a job start in the database.
@@ -284,8 +286,8 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // job_id reuse after a Raft wipe means a conflict is a new, unrelated job.
     sqlx::query(
         r#"
-        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation, idle_fill)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'RUNNING', $13, $14)
+        INSERT INTO jobs (job_id, name, user_name, account, partition_name, qos, num_nodes, num_tasks, cpus_per_task, memory_mb, submit_time, start_time, state, reservation, idle_fill, time_limit_min)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'RUNNING', $13, $14, $15)
         ON CONFLICT (job_id) DO UPDATE SET
             name = EXCLUDED.name,
             user_name = EXCLUDED.user_name,
@@ -304,6 +306,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
             derived_exit_code = 0,
             end_time = NULL,
             idle_fill = EXCLUDED.idle_fill,
+            time_limit_min = EXCLUDED.time_limit_min,
             -- A requeued job starts again on the same row, so provenance from the
             -- run that was evicted must be cleared or the job reads as
             -- `COMPLETED, PreemptMode=Requeue` forever once it finally succeeds.
@@ -327,6 +330,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     .bind(rec.start_time)
     .bind(rec.reservation.as_deref().unwrap_or_default())
     .bind(rec.idle_fill)
+    .bind(rec.time_limit_min)
     .execute(&mut *conn)
     .await?;
 
@@ -524,6 +528,7 @@ pub struct JobRecord {
     pub preempt_qos: String,
     /// True when the run took borrowed capacity rather than the job's own quota.
     pub idle_fill: bool,
+    pub time_limit_min: Option<i32>,
 }
 
 /// Filters for [`get_job_history`]. A `None` or empty-slice field is an
@@ -548,7 +553,7 @@ pub async fn get_job_history(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          exit_signal, derived_exit_code, num_nodes, num_tasks, nodelist, \
          submit_time, start_time, end_time, reservation, \
-         preempted_by, preempt_mode, preempt_qos, idle_fill \
+         preempted_by, preempt_mode, preempt_qos, idle_fill, time_limit_min \
          FROM jobs WHERE 1=1",
     );
 
@@ -611,6 +616,7 @@ pub async fn get_job_history(
             preempt_mode: row.get("preempt_mode"),
             preempt_qos: row.get("preempt_qos"),
             idle_fill: row.get("idle_fill"),
+            time_limit_min: row.get("time_limit_min"),
         })
         .collect();
 
@@ -1737,6 +1743,7 @@ mod job_history_tests {
                 start_time,
                 reservation: Some(reservation.to_string()),
                 idle_fill: false,
+                time_limit_min: None,
             },
         )
         .await
@@ -1794,6 +1801,7 @@ mod job_history_tests {
                 start_time,
                 reservation: Some(String::new()),
                 idle_fill: false,
+                time_limit_min: None,
             },
         )
         .await?;

@@ -239,6 +239,7 @@ async fn write_start(conn: &mut sqlx::PgConnection, job: &Job) -> anyhow::Result
             start_time,
             reservation: spec.reservation.clone(),
             idle_fill: job.idle_fill,
+            time_limit_min: spec.time_limit.map(|d| d.num_minutes() as i32),
         },
     )
     .await
@@ -611,6 +612,7 @@ mod tests {
                     start_time: job.start_time.unwrap(),
                     reservation: None,
                     idle_fill: false,
+                    time_limit_min: None,
                 },
             )
             .await?;
