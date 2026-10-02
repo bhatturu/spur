@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use clap::parser::ValueSource;
@@ -413,6 +413,24 @@ async fn main() -> anyhow::Result<()> {
             root = %stepds.root().display(),
             "reporting PID-fenced stepds before asynchronous reconnect"
         );
+    }
+
+    // GC orphaned job spool directories left behind by previous runs whose
+    // cleanup was interrupted (spurd crash, I/O error swallowed by best-effort
+    // remove). Any job still tracked (live, stale-but-being-reaped, or
+    // corrupted-but-fenced) keeps its spool; everything else is removed.
+    {
+        let mut active: HashSet<u32> = HashSet::new();
+        for d in &recovered_stepds {
+            active.insert(d.job_id);
+        }
+        for d in &stale_stepds {
+            active.insert(d.job_id);
+        }
+        for &(job_id, _, _) in &corrupted_stepds {
+            active.insert(job_id);
+        }
+        executor::gc_orphan_spool_dirs(&active);
     }
 
     // WireGuard interface for mesh address/key/peers. Resolution: SPUR_WG_INTERFACE env >
