@@ -423,10 +423,7 @@ mod tests {
             "self-parent account must still get a share"
         );
         let sr = shares.get("self_ref").copied().unwrap();
-        assert!(
-            sr > 0.0,
-            "self-parent share must be positive, got {sr}"
-        );
+        assert!(sr > 0.0, "self-parent share must be positive, got {sr}");
     }
 
     #[test]
