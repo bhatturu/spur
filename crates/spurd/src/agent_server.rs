@@ -6736,16 +6736,31 @@ impl SlurmAgent for AgentService {
             }
 
             // Finished on disk (step completed while nobody was listening).
-            if let Ok(Some((exit_code, signal))) =
-                store.observed_exit(job_id, step_run_attempt, step_id)
-            {
-                info!(
-                    job_id,
-                    step_id, step_run_attempt, "step finished (durable); returning recorded result"
-                );
-                return Ok(Response::new(
-                    awaited_step_response(job_id, step_id, exit_code, signal).await,
-                ));
+            match store.observed_exit(job_id, step_run_attempt, step_id) {
+                Ok(Some((exit_code, signal))) => {
+                    info!(
+                        job_id,
+                        step_id,
+                        step_run_attempt,
+                        "step finished (durable); returning recorded result"
+                    );
+                    return Ok(Response::new(
+                        awaited_step_response(job_id, step_id, exit_code, signal).await,
+                    ));
+                }
+                Err(error) => {
+                    warn!(
+                        job_id,
+                        step_id,
+                        step_run_attempt,
+                        %error,
+                        "failed to read step's durable exit; refusing relaunch"
+                    );
+                    return Err(Status::internal(format!(
+                        "cannot determine whether step {job_id}.{step_id} already ran: {error}"
+                    )));
+                }
+                Ok(None) => {}
             }
 
             // Supervisor still tracked — step is running or just finishing.
@@ -6779,9 +6794,37 @@ impl SlurmAgent for AgentService {
                             )
                             .await,
                         )),
-                        Err(_) => Err(Status::internal(
-                            "step supervisor exited without reporting a status",
-                        )),
+                        Err(_) => {
+                            // The waiter was dropped without delivering — the
+                            // step may have finished between the stepds check
+                            // and reregister. Re-check settled/durable before
+                            // reporting a hard failure.
+                            if let Some(outcome) = self
+                                .step_completions
+                                .settled(job_id, step_run_attempt, step_id)
+                                .await
+                            {
+                                return Ok(Response::new(
+                                    awaited_step_response(
+                                        job_id,
+                                        step_id,
+                                        outcome.exit_code,
+                                        outcome.signal,
+                                    )
+                                    .await,
+                                ));
+                            }
+                            if let Ok(Some((exit_code, signal))) =
+                                store.observed_exit(job_id, step_run_attempt, step_id)
+                            {
+                                return Ok(Response::new(
+                                    awaited_step_response(job_id, step_id, exit_code, signal).await,
+                                ));
+                            }
+                            return Err(Status::internal(
+                                "step supervisor exited without reporting a status",
+                            ));
+                        }
                     };
                 }
                 // A waiter is still parked from the original launch: the old
@@ -20005,5 +20048,161 @@ mod tests {
             "non-interactive bridge dropped output after input close, got: {text:?}"
         );
         assert!(got_exit, "bridge did not report an exit status");
+    }
+
+    // -- run_command idempotency (controller-restart resilience) --
+
+    fn run_command_req(job_id: u32) -> RunCommandRequest {
+        RunCommandRequest {
+            command: vec!["echo".into(), "hello".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_returns_settled_result_without_relaunching() {
+        let (svc, job_id) = run_command_test_setup().await;
+        svc.step_completions
+            .complete(
+                job_id,
+                0,
+                0,
+                crate::step_completion::StepOutcome {
+                    exit_code: 0,
+                    signal: 0,
+                },
+            )
+            .await;
+
+        let resp = svc
+            .run_command(Request::new(run_command_req(job_id)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn run_command_returns_settled_nonzero_exit() {
+        let (svc, job_id) = run_command_test_setup().await;
+        svc.step_completions
+            .complete(
+                job_id,
+                0,
+                0,
+                crate::step_completion::StepOutcome {
+                    exit_code: 42,
+                    signal: 0,
+                },
+            )
+            .await;
+
+        let resp = svc
+            .run_command(Request::new(run_command_req(job_id)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.exit_code, 42, "settled non-zero exit must be returned");
+    }
+
+    fn test_stepd_descriptor(job_id: u32) -> crate::stepd::StepdDescriptor {
+        crate::stepd::StepdDescriptor {
+            format_version: 1,
+            job_id,
+            run_attempt: 0,
+            step_id: 0,
+            pid: 99999,
+            process_start_ticks: 0,
+            socket_path: "/dev/null".into(),
+            cgroup_path: "/dev/null".into(),
+            capability: String::new(),
+            owner: String::new(),
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            resources: Default::default(),
+            workload_pid: 0,
+            workload_start_ticks: 0,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            container_rootfs_mode: None,
+            cred_id: String::new(),
+            cred_kid: String::new(),
+            cred_digest: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_returns_unavailable_when_waiter_is_parked() {
+        let (svc, job_id) = run_command_test_setup().await;
+        svc.stepds
+            .lock()
+            .await
+            .insert((job_id, 0), test_stepd_descriptor(job_id));
+        let _waiter = svc.step_completions.register(job_id, 0, 0).await;
+
+        let err = svc
+            .run_command(Request::new(run_command_req(job_id)))
+            .await
+            .expect_err("must return Unavailable when a waiter is parked");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn run_command_joins_running_step_via_reregister() {
+        let completions = crate::step_completion::StepCompletions::new();
+        let job_id = 999u32;
+        let step_id = 0u32;
+        let run_attempt = 0u32;
+
+        drop(completions.register(job_id, run_attempt, step_id).await);
+
+        let waiter = completions
+            .reregister(job_id, run_attempt, step_id)
+            .await
+            .expect("slot must be free after the original waiter was dropped");
+
+        let completions2 = completions.clone();
+        let handle = tokio::spawn(async move { waiter.await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        completions2
+            .complete(
+                job_id,
+                run_attempt,
+                step_id,
+                crate::step_completion::StepOutcome {
+                    exit_code: 7,
+                    signal: 0,
+                },
+            )
+            .await;
+
+        let outcome = handle.await.unwrap().expect("waiter must resolve");
+        assert_eq!(
+            outcome.exit_code, 7,
+            "joined waiter must see the step's exit code"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_fresh_launch_when_no_prior_step() {
+        let (svc, job_id) = run_command_test_setup().await;
+        // No settled result, no stepds entry — should launch fresh.
+        let resp = svc
+            .run_command(Request::new(run_command_req(job_id)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.exit_code, 0);
+        assert_eq!(resp.stdout.trim(), "hello");
     }
 }

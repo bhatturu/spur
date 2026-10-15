@@ -9763,6 +9763,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_step_returns_nonzero_exit_for_failed_step() {
+        use spur_core::resource::ResourceAllocations;
+        use spur_core::step::{JobStep, StepState, TaskDistribution};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+        let allocated_nodes = svc.cluster.get_job(job_id).unwrap().allocated_nodes.clone();
+        svc.cluster
+            .create_step(JobStep {
+                job_id,
+                step_id: 0,
+                name: "failed".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: allocated_nodes,
+                distribution: TaskDistribution::Block,
+                start_time: Some(chrono::Utc::now()),
+                end_time: None,
+                exit_code: None,
+            })
+            .expect("test setup: seed step");
+        svc.cluster
+            .record_step_complete(job_id, 0, 42)
+            .expect("test setup: complete step with non-zero exit");
+
+        let resp = svc
+            .run_step(Request::new(RunStepRequest {
+                job_id,
+                command: vec!["true".into()],
+                step_id: 0,
+                user: "ubuntu".into(),
+                ..Default::default()
+            }))
+            .await
+            .expect("a failed step returns its recorded exit code")
+            .into_inner();
+        assert_eq!(resp.exit_code, 42, "non-zero exit code must be preserved");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_step_rejects_nodes_no_longer_allocated() {
         use spur_core::resource::ResourceAllocations;
         use spur_core::step::{JobStep, StepState, TaskDistribution};

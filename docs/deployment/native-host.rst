@@ -773,7 +773,7 @@ the MPI binary are in place:
 
    scontrol ping
    sinfo                                    # all agents idle/ready
-   srun --mpi=list                          # expect: none, pmix
+   srun --mpi=list                          # expect: none, pmix, mpirun
    srun --mpi=pmix -n4 /path/to/hello_mpi   # single-node smoke test
    srun --mpi=pmix -N2 -n2 /path/to/hello_mpi   # one rank per node: the layout most sensitive to a broken env.sh
    srun --mpi=pmix -N2 -n4 /path/to/hello_mpi   # 4 ranks total (2 per node)

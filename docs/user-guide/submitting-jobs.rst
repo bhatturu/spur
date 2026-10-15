@@ -455,7 +455,9 @@ Open MPI expects.  The ``--mpi=mpirun`` value appears in
    process that PRRTE uses for daemon placement retries the controller
    connection for up to 60 seconds (30 attempts x 2 s backoff).  If the
    controller is back within that window, the agent recognises the
-   already-running step and returns its result without relaunching.
+   already-running step and joins it, or returns the recorded exit code
+   if it already finished.  Step output is not replayed on the
+   already-finished path.
 
 Distributed-training rendezvous variables
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
