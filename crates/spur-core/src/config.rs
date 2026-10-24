@@ -680,6 +680,58 @@ pub struct SchedulerConfig {
     /// factor above cannot do because it scales with the team's own quota.
     #[serde(default)]
     pub idle_fill_max_cluster_fraction: f64,
+    /// TRES billing weights for fairshare usage computation, in the format
+    /// `"CPU=<w>,GRES/gpu=<w>"`.  Omitted weights default to 1.0.  Set
+    /// `CPU=0.0,GRES/gpu=1.0` for GPU-only billing on a GPU cluster.
+    #[serde(default)]
+    pub tres_billing_weights: String,
+}
+
+/// Parsed TRES billing weights for fairshare computation.
+#[derive(Debug, Clone, Copy)]
+pub struct BillingWeights {
+    pub cpu: f64,
+    pub gpu: f64,
+}
+
+impl Default for BillingWeights {
+    fn default() -> Self {
+        Self { cpu: 1.0, gpu: 1.0 }
+    }
+}
+
+impl BillingWeights {
+    /// Parse Slurm-style `TRESBillingWeights` string, e.g.
+    /// `"CPU=0.0,Mem=0.0,GRES/gpu=1.0"`.  Unknown keys are silently ignored
+    /// (forward-compatible with future TRES types).  Omitted keys keep their
+    /// default (1.0).  An empty string yields the default 1:1 weights.
+    pub fn parse(s: &str) -> Self {
+        let mut w = Self::default();
+        for token in s.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let Some((key, val)) = token.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().to_ascii_uppercase();
+            let Ok(v) = val.trim().parse::<f64>() else {
+                continue;
+            };
+            match key.as_str() {
+                "CPU" => w.cpu = v.max(0.0),
+                "GRES/GPU" => w.gpu = v.max(0.0),
+                _ => {}
+            }
+        }
+        w
+    }
+
+    /// Compute the weighted billing value from raw CPU and GPU seconds.
+    pub fn bill(&self, cpu_seconds: i64, gpu_seconds: i64) -> f64 {
+        self.cpu * cpu_seconds as f64 + self.gpu * gpu_seconds as f64
+    }
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -728,7 +780,14 @@ impl Default for SchedulerConfig {
             idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
             idle_fill_max_borrow_factor: 0.0,
             idle_fill_max_cluster_fraction: 0.0,
+            tres_billing_weights: String::new(),
         }
+    }
+}
+
+impl SchedulerConfig {
+    pub fn billing_weights(&self) -> BillingWeights {
+        BillingWeights::parse(&self.tres_billing_weights)
     }
 }
 
@@ -5042,5 +5101,81 @@ memlock = "inherit"
             config.rlimits.memlock_limit().unwrap(),
             MemlockLimit::Inherit
         );
+    }
+
+    #[test]
+    fn billing_weights_default_is_one_to_one() {
+        let w = BillingWeights::default();
+        assert_eq!(w.cpu, 1.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_gpu_only() {
+        let w = BillingWeights::parse("CPU=0.0,GRES/gpu=1.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_mixed() {
+        let w = BillingWeights::parse("CPU=0.5, GRES/gpu=2.0");
+        assert_eq!(w.cpu, 0.5);
+        assert_eq!(w.gpu, 2.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_empty_is_default() {
+        let w = BillingWeights::parse("");
+        assert_eq!(w.cpu, 1.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_case_insensitive() {
+        let w = BillingWeights::parse("cpu=0.0,gres/GPU=3.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 3.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_ignores_unknown_keys() {
+        let w = BillingWeights::parse("CPU=0.0,Mem=0.5,GRES/gpu=1.0,GRES/nic=2.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_clamps_negative_to_zero() {
+        let w = BillingWeights::parse("CPU=-5.0,GRES/gpu=-1.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 0.0);
+    }
+
+    #[test]
+    fn billing_weights_bill_applies_weights() {
+        let w = BillingWeights::parse("CPU=0.0,GRES/gpu=1.0");
+        assert_eq!(w.bill(20_390_400, 691_200), 691_200.0);
+        assert_eq!(w.bill(172_800, 691_200), 691_200.0);
+    }
+
+    #[test]
+    fn billing_weights_bill_default_sums_both() {
+        let w = BillingWeights::default();
+        assert_eq!(w.bill(100, 200), 300.0);
+    }
+
+    #[test]
+    fn scheduler_config_billing_weights_accessor() {
+        let toml = r#"
+cluster_name = "test"
+
+[scheduler]
+tres_billing_weights = "CPU=0.0,GRES/gpu=1.0"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let w = config.scheduler.billing_weights();
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 1.0);
     }
 }

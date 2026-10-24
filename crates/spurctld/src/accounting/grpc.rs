@@ -161,6 +161,7 @@ struct AccountingInner {
     assoc: parking_lot::RwLock<Option<std::sync::Arc<crate::association_cache::AssociationCache>>>,
     auth: parking_lot::RwLock<spur_core::config::AuthConfig>,
     fairshare_halflife_days: std::sync::atomic::AtomicU32,
+    billing_weights: parking_lot::RwLock<spur_core::config::BillingWeights>,
 }
 
 impl Clone for AccountingService {
@@ -180,6 +181,7 @@ impl AccountingService {
                 assoc: parking_lot::RwLock::new(None),
                 auth: parking_lot::RwLock::new(spur_core::config::AuthConfig::default()),
                 fairshare_halflife_days: std::sync::atomic::AtomicU32::new(0),
+                billing_weights: parking_lot::RwLock::new(spur_core::config::BillingWeights::default()),
             }),
         }
     }
@@ -188,6 +190,14 @@ impl AccountingService {
         self.inner
             .fairshare_halflife_days
             .store(days, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn attach_billing_weights(&self, weights: spur_core::config::BillingWeights) {
+        *self.inner.billing_weights.write() = weights;
+    }
+
+    fn billing_weights(&self) -> spur_core::config::BillingWeights {
+        *self.inner.billing_weights.read()
     }
 
     fn configured_halflife_days(&self) -> u32 {
@@ -569,7 +579,12 @@ impl SlurmAccounting for AccountingService {
             })
             .collect();
 
-        Ok(Response::new(GetUsageResponse { entries }))
+        let w = self.billing_weights();
+        Ok(Response::new(GetUsageResponse {
+            entries,
+            billing_weight_cpu: w.cpu,
+            billing_weight_gpu: w.gpu,
+        }))
     }
 
     // ============================================================
@@ -1057,7 +1072,8 @@ impl SlurmAccounting for AccountingService {
             req.halflife_days
         };
 
-        let raw_factors = super::fairshare_factors(&pool, halflife)
+        let weights = self.billing_weights();
+        let raw_factors = super::fairshare_factors(&pool, halflife, &weights)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 

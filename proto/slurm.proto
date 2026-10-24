@@ -1564,6 +1564,9 @@ message UsageEntry {
 
 message GetUsageResponse {
   repeated UsageEntry entries = 1;
+  // Billing weights so sshare/sprio can display weighted RawUsage.
+  double billing_weight_cpu = 2;
+  double billing_weight_gpu = 3;
 }
 
 message GetFairshareFactorsRequest {

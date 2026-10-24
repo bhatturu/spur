@@ -53,6 +53,7 @@ pub(crate) fn start(
     service.attach_association_cache(cluster.association_cache().clone());
     service.attach_auth(config.auth.clone());
     service.attach_fairshare_halflife(config.scheduler.fairshare_halflife_days);
+    service.attach_billing_weights(config.scheduler.billing_weights());
     let bringup = service.clone();
     let url = config.accounting.database_url.clone();
     let params = ActivationParams::from_config(config);
@@ -70,6 +71,7 @@ struct ActivationParams {
     refresh_secs: u64,
     grp_wall_window_days: u32,
     txn_retention_days: Option<u32>,
+    billing_weights: spur_core::config::BillingWeights,
 }
 
 impl ActivationParams {
@@ -79,6 +81,7 @@ impl ActivationParams {
             refresh_secs: config.accounting.fairshare_refresh_secs as u64,
             grp_wall_window_days: config.accounting.grp_wall_window_days,
             txn_retention_days: config.accounting.txn_retention_days.filter(|d| *d > 0),
+            billing_weights: config.scheduler.billing_weights(),
         }
     }
 }
@@ -176,6 +179,7 @@ fn activate(
         pool.clone(),
         params.fairshare_halflife_days,
         params.refresh_secs,
+        params.billing_weights,
     );
     cluster
         .qos_cache()
@@ -197,6 +201,7 @@ fn activate(
 pub async fn fairshare_factors(
     pool: &PgPool,
     halflife_days: u32,
+    billing_weights: &spur_core::config::BillingWeights,
 ) -> anyhow::Result<HashMap<(String, String), f64>> {
     let halflife_days = if halflife_days == 0 {
         14
@@ -221,6 +226,7 @@ pub async fn fairshare_factors(
         &user_weights,
         halflife_days,
         now,
+        billing_weights,
     ))
 }
 
