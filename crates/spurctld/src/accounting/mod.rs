@@ -53,6 +53,7 @@ pub(crate) fn start(
     service.attach_association_cache(cluster.association_cache().clone());
     service.attach_auth(config.auth.clone());
     service.attach_fairshare_halflife(config.scheduler.fairshare_halflife_days);
+    service.attach_billing_weights(config.scheduler.billing_weights());
     let bringup = service.clone();
     let url = config.accounting.database_url.clone();
     let params = ActivationParams::from_config(config);
@@ -70,6 +71,8 @@ struct ActivationParams {
     refresh_secs: u64,
     grp_wall_window_days: u32,
     txn_retention_days: Option<u32>,
+    billing_weights: spur_core::config::BillingWeights,
+    usage_reset_period: spur_core::config::UsageResetPeriod,
 }
 
 impl ActivationParams {
@@ -79,6 +82,8 @@ impl ActivationParams {
             refresh_secs: config.accounting.fairshare_refresh_secs as u64,
             grp_wall_window_days: config.accounting.grp_wall_window_days,
             txn_retention_days: config.accounting.txn_retention_days.filter(|d| *d > 0),
+            billing_weights: config.scheduler.billing_weights(),
+            usage_reset_period: config.scheduler.usage_reset_period,
         }
     }
 }
@@ -172,10 +177,15 @@ fn activate(
         spawn_txn_purge_loop(pool.clone(), raft.clone(), days, Duration::from_secs(3600));
     }
 
+    if params.usage_reset_period != spur_core::config::UsageResetPeriod::None {
+        spawn_usage_reset_loop(pool.clone(), params.usage_reset_period);
+    }
+
     cluster.fairshare_cache().spawn_refresh_loop(
         pool.clone(),
         params.fairshare_halflife_days,
         params.refresh_secs,
+        params.billing_weights,
     );
     cluster
         .qos_cache()
@@ -190,6 +200,96 @@ fn activate(
     );
 }
 
+fn spawn_usage_reset_loop(pool: PgPool, period: spur_core::config::UsageResetPeriod) {
+    use chrono::{Datelike, Timelike, Utc};
+    use spur_core::config::UsageResetPeriod;
+
+    tokio::spawn(async move {
+        tracing::info!(period = period.as_str(), "usage reset loop started");
+        loop {
+            let now = Utc::now();
+            let next = match period {
+                UsageResetPeriod::None => return,
+                UsageResetPeriod::Daily => {
+                    (now + chrono::Duration::days(1))
+                        .date_naive()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                }
+                UsageResetPeriod::Weekly => {
+                    let days_until_sunday =
+                        (7 - now.weekday().num_days_from_sunday()) % 7;
+                    let days_until_sunday = if days_until_sunday == 0 && now.hour() > 0 {
+                        7
+                    } else if days_until_sunday == 0 {
+                        0
+                    } else {
+                        days_until_sunday
+                    };
+                    (now + chrono::Duration::days(days_until_sunday as i64))
+                        .date_naive()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                }
+                UsageResetPeriod::Monthly => {
+                    let (y, m) = if now.month() == 12 {
+                        (now.year() + 1, 1)
+                    } else {
+                        (now.year(), now.month() + 1)
+                    };
+                    chrono::NaiveDate::from_ymd_opt(y, m, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                }
+                UsageResetPeriod::Quarterly => {
+                    let next_q_month = ((now.month() - 1) / 3 + 1) * 3 + 1;
+                    let (y, m) = if next_q_month > 12 {
+                        (now.year() + 1, next_q_month - 12)
+                    } else {
+                        (now.year(), next_q_month)
+                    };
+                    chrono::NaiveDate::from_ymd_opt(y, m, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                }
+                UsageResetPeriod::Yearly => {
+                    chrono::NaiveDate::from_ymd_opt(now.year() + 1, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                }
+            };
+            let wait = (next - now).to_std().unwrap_or(Duration::from_secs(86400));
+            tracing::info!(
+                period = period.as_str(),
+                next_reset = %next,
+                wait_secs = wait.as_secs(),
+                "usage reset scheduled"
+            );
+            tokio::time::sleep(wait).await;
+
+            match db::reset_all_usage(&pool).await {
+                Ok(rows) => tracing::info!(
+                    period = period.as_str(),
+                    rows_deleted = rows,
+                    "periodic usage reset completed"
+                ),
+                Err(e) => tracing::error!(
+                    error = %e,
+                    "periodic usage reset failed"
+                ),
+            }
+        }
+    });
+}
+
 /// Compute fairshare factors directly from the database.
 ///
 /// Reused by both the gRPC `GetFairshareFactors` RPC and the controller's
@@ -197,6 +297,7 @@ fn activate(
 pub async fn fairshare_factors(
     pool: &PgPool,
     halflife_days: u32,
+    billing_weights: &spur_core::config::BillingWeights,
 ) -> anyhow::Result<HashMap<(String, String), f64>> {
     let halflife_days = if halflife_days == 0 {
         14
@@ -221,6 +322,7 @@ pub async fn fairshare_factors(
         &user_weights,
         halflife_days,
         now,
+        billing_weights,
     ))
 }
 

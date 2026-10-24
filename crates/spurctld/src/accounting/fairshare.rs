@@ -5,16 +5,19 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 
+use spur_core::config::BillingWeights;
+
 use super::db::UsageRecord;
 
 /// Compute per-(user, account) fair-share factors using hierarchical BFS shares,
-/// per-user association weights, and decay-weighted CPU+GPU billable usage.
+/// per-user association weights, and decay-weighted billable usage.
 pub(super) fn compute_fairshare(
     usage: &[UsageRecord],
     accounts: &[super::db::AccountRecord],
     user_weights: &HashMap<(String, String), i32>,
     halflife_days: u32,
     now: DateTime<Utc>,
+    billing_weights: &BillingWeights,
 ) -> HashMap<(String, String), f64> {
     if accounts.is_empty() {
         return HashMap::new();
@@ -32,7 +35,7 @@ pub(super) fn compute_fairshare(
     for record in usage {
         let age = (now - record.period_start).num_seconds().max(0) as f64;
         let decay = (-decay_rate * age).exp();
-        let billable = (record.cpu_seconds + record.gpu_seconds) as f64 * decay;
+        let billable = billing_weights.bill(record.cpu_seconds, record.gpu_seconds, record.mem_mb_seconds) * decay;
 
         *user_usage
             .entry((record.user_name.clone(), record.account.clone()))
@@ -213,6 +216,7 @@ mod tests {
                 account: "research".into(),
                 cpu_seconds: 100_000,
                 gpu_seconds: 50_000,
+                mem_mb_seconds: 0,
                 job_count: 10,
                 period_start: now - Duration::days(1),
             },
@@ -221,6 +225,7 @@ mod tests {
                 account: "engineering".into(),
                 cpu_seconds: 10_000,
                 gpu_seconds: 0,
+                mem_mb_seconds: 0,
                 job_count: 2,
                 period_start: now - Duration::days(1),
             },
@@ -235,7 +240,7 @@ mod tests {
         user_weights.insert(("alice".into(), "research".into()), 1);
         user_weights.insert(("bob".into(), "engineering".into()), 1);
 
-        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now);
+        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now, &BillingWeights::default());
 
         let alice_factor = factors.get(&("alice".into(), "research".into())).unwrap();
         let bob_factor = factors.get(&("bob".into(), "engineering".into())).unwrap();
@@ -253,6 +258,7 @@ mod tests {
                 account: "research".into(),
                 cpu_seconds: 10_000,
                 gpu_seconds: 90_000,
+                mem_mb_seconds: 0,
                 job_count: 5,
                 period_start: now - Duration::days(1),
             },
@@ -261,6 +267,7 @@ mod tests {
                 account: "research".into(),
                 cpu_seconds: 10_000,
                 gpu_seconds: 0,
+                mem_mb_seconds: 0,
                 job_count: 5,
                 period_start: now - Duration::days(1),
             },
@@ -271,7 +278,7 @@ mod tests {
         user_weights.insert(("alice".into(), "research".into()), 1);
         user_weights.insert(("bob".into(), "research".into()), 1);
 
-        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now);
+        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now, &BillingWeights::default());
         let alice = factors.get(&("alice".into(), "research".into())).unwrap();
         let bob = factors.get(&("bob".into(), "research".into())).unwrap();
         assert!(bob > alice);
@@ -292,6 +299,7 @@ mod tests {
                 account: "child_a".into(),
                 cpu_seconds: 10_000,
                 gpu_seconds: 0,
+                mem_mb_seconds: 0,
                 job_count: 1,
                 period_start: now - Duration::days(1),
             },
@@ -300,6 +308,7 @@ mod tests {
                 account: "child_b".into(),
                 cpu_seconds: 10_000,
                 gpu_seconds: 0,
+                mem_mb_seconds: 0,
                 job_count: 1,
                 period_start: now - Duration::days(1),
             },
@@ -309,7 +318,7 @@ mod tests {
         user_weights.insert(("alice".into(), "child_a".into()), 1);
         user_weights.insert(("bob".into(), "child_b".into()), 1);
 
-        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now);
+        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now, &BillingWeights::default());
         let alice = factors.get(&("alice".into(), "child_a".into())).unwrap();
         let bob = factors.get(&("bob".into(), "child_b".into())).unwrap();
         assert!(alice > bob);
@@ -324,7 +333,7 @@ mod tests {
                 .into_iter()
                 .collect();
 
-        let factors = compute_fairshare(&[], &accounts, &user_weights, 14, now);
+        let factors = compute_fairshare(&[], &accounts, &user_weights, 14, now, &BillingWeights::default());
         let idle = factors
             .get(&("idle_user".into(), "research".into()))
             .unwrap();
@@ -358,6 +367,7 @@ mod tests {
                 account: "child_a".into(),
                 cpu_seconds: 100_000,
                 gpu_seconds: 0,
+                mem_mb_seconds: 0,
                 job_count: 1,
                 period_start: now - Duration::days(1),
             },
@@ -366,6 +376,7 @@ mod tests {
                 account: "child_b".into(),
                 cpu_seconds: 100_000,
                 gpu_seconds: 0,
+                mem_mb_seconds: 0,
                 job_count: 1,
                 period_start: now - Duration::days(1),
             },
@@ -375,7 +386,7 @@ mod tests {
         user_weights.insert(("alice".into(), "child_a".into()), 1);
         user_weights.insert(("bob".into(), "child_b".into()), 1);
 
-        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now);
+        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now, &BillingWeights::default());
         let alice = *factors.get(&("alice".into(), "child_a".into())).unwrap();
         let bob = *factors.get(&("bob".into(), "child_b".into())).unwrap();
         // Same usage but alice has 3× the share → alice's factor should be ~3× bob's.
@@ -446,6 +457,7 @@ mod tests {
                 account: "dev".into(),
                 cpu_seconds: 10_000,
                 gpu_seconds: 90_000,
+                mem_mb_seconds: 0,
                 job_count: 5,
                 period_start: now - Duration::days(1),
             },
@@ -454,12 +466,13 @@ mod tests {
                 account: "dev".into(),
                 cpu_seconds: 10_000,
                 gpu_seconds: 0,
+                mem_mb_seconds: 0,
                 job_count: 5,
                 period_start: now - Duration::days(1),
             },
         ];
 
-        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now);
+        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now, &BillingWeights::default());
         let gpu = *factors.get(&("gpu_user".into(), "dev".into())).unwrap();
         let cpu = *factors.get(&("cpu_user".into(), "dev".into())).unwrap();
         // cpu_user used 10× less → factor should be ~10× higher
@@ -467,6 +480,64 @@ mod tests {
             cpu / gpu > 5.0,
             "cpu_user factor should be much higher than gpu_user, ratio={:.2}",
             cpu / gpu
+        );
+    }
+
+    #[test]
+    fn gpu_only_weights_ignore_cpu_gaming() {
+        let now = Utc::now();
+        let accounts = vec![make_account("dev", None, 1)];
+        let mut user_weights = HashMap::new();
+        user_weights.insert(("honest".into(), "dev".into()), 1);
+        user_weights.insert(("gamer".into(), "dev".into()), 1);
+
+        // Both users hold 8 GPUs for the same duration.
+        // "honest" declares 236 CPUs; "gamer" declares 1.
+        let usage = vec![
+            UsageRecord {
+                user_name: "honest".into(),
+                account: "dev".into(),
+                cpu_seconds: 20_390_400,
+                gpu_seconds: 691_200,
+                mem_mb_seconds: 0,
+                job_count: 1,
+                period_start: now - Duration::days(1),
+            },
+            UsageRecord {
+                user_name: "gamer".into(),
+                account: "dev".into(),
+                cpu_seconds: 86_400,
+                gpu_seconds: 691_200,
+                mem_mb_seconds: 0,
+                job_count: 1,
+                period_start: now - Duration::days(1),
+            },
+        ];
+
+        // With default 1:1 weights, "honest" is heavily penalized
+        let factors_default = compute_fairshare(
+            &usage, &accounts, &user_weights, 14, now, &BillingWeights::default(),
+        );
+        let honest_default = *factors_default.get(&("honest".into(), "dev".into())).unwrap();
+        let gamer_default = *factors_default.get(&("gamer".into(), "dev".into())).unwrap();
+        assert!(
+            gamer_default / honest_default > 5.0,
+            "with default weights, gamer should have much higher factor (gaming works), ratio={:.2}",
+            gamer_default / honest_default
+        );
+
+        // With GPU-only weights, both users are equal
+        let gpu_only = BillingWeights::parse("CPU=0.0,GRES/gpu=1.0");
+        let factors_gpu = compute_fairshare(
+            &usage, &accounts, &user_weights, 14, now, &gpu_only,
+        );
+        let honest_gpu = *factors_gpu.get(&("honest".into(), "dev".into())).unwrap();
+        let gamer_gpu = *factors_gpu.get(&("gamer".into(), "dev".into())).unwrap();
+        let ratio = (honest_gpu / gamer_gpu).abs();
+        assert!(
+            (ratio - 1.0).abs() < 0.01,
+            "with GPU-only weights, both users should have equal factors, ratio={:.4}",
+            ratio
         );
     }
 }

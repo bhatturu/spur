@@ -177,6 +177,7 @@ DO $$ BEGIN
 END $$;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS total_gpus INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS usage_recorded BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE usage ADD COLUMN IF NOT EXISTS mem_mb_seconds BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reason TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reason_detail TEXT NOT NULL DEFAULT '';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS ended_by TEXT NOT NULL DEFAULT '';
@@ -379,7 +380,7 @@ pub async fn record_job_start(conn: &mut PgConnection, rec: &JobStartRecord) -> 
     // If end_time is already set, the end notification arrived first and skipped
     // usage computation (start_time was NULL at that point). Compute it now.
     let row = sqlx::query(
-        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, end_time, state, idle_fill FROM jobs WHERE job_id = $1",
+        "SELECT user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, memory_mb, qos, end_time, state, idle_fill FROM jobs WHERE job_id = $1",
     )
     .bind(rec.job_id as i64)
     .fetch_one(&mut *conn)
@@ -440,7 +441,7 @@ pub async fn record_job_end(conn: &mut PgConnection, rec: &JobEndRecord) -> anyh
             reason_detail = $11,
             ended_by = $12,
             ended_by_uid = $13
-        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, qos, state, idle_fill
+        RETURNING user_name, account, start_time, num_tasks, cpus_per_task, total_gpus, memory_mb, qos, state, idle_fill
         "#,
     )
     .bind(rec.job_id as i64)
@@ -547,11 +548,13 @@ async fn update_usage(
     let num_tasks: i32 = row.get("num_tasks");
     let cpus_per_task: i32 = row.get("cpus_per_task");
     let total_gpus: i32 = row.get("total_gpus");
+    let memory_mb: i64 = row.get("memory_mb");
     let qos_name: String = row.get("qos");
 
     let duration_secs = (end_time - start_time).num_seconds().max(0);
     let cpu_seconds = duration_secs * (num_tasks as i64) * (cpus_per_task as i64);
     let gpu_seconds = duration_secs * (total_gpus as i64);
+    let mem_mb_seconds = duration_secs * memory_mb;
 
     let usage_factor: f64 = if !qos_name.is_empty() {
         sqlx::query_scalar("SELECT usage_factor FROM qos WHERE name = $1")
@@ -566,6 +569,7 @@ async fn update_usage(
 
     let cpu_seconds = (cpu_seconds as f64 * usage_factor) as i64;
     let gpu_seconds = (gpu_seconds as f64 * usage_factor) as i64;
+    let mem_mb_seconds = (mem_mb_seconds as f64 * usage_factor) as i64;
 
     let period_start = start_time
         .date_naive()
@@ -576,11 +580,12 @@ async fn update_usage(
 
     sqlx::query(
         r#"
-        INSERT INTO usage (user_name, account, period_start, period_end, cpu_seconds, gpu_seconds, job_count)
-        VALUES ($1, $2, $3, $4, $5, $6, 1)
+        INSERT INTO usage (user_name, account, period_start, period_end, cpu_seconds, gpu_seconds, mem_mb_seconds, job_count)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 1)
         ON CONFLICT (user_name, account, period_start) DO UPDATE SET
             cpu_seconds = usage.cpu_seconds + $5,
             gpu_seconds = usage.gpu_seconds + $6,
+            mem_mb_seconds = usage.mem_mb_seconds + $7,
             job_count = usage.job_count + 1
         "#,
     )
@@ -590,6 +595,7 @@ async fn update_usage(
     .bind(period_end)
     .bind(cpu_seconds)
     .bind(gpu_seconds)
+    .bind(mem_mb_seconds)
     .execute(&mut *conn)
     .await?;
 
@@ -894,6 +900,7 @@ pub async fn get_usage(
         SELECT user_name, account,
                SUM(cpu_seconds)::BIGINT as total_cpu_seconds,
                SUM(gpu_seconds)::BIGINT as total_gpu_seconds,
+               SUM(mem_mb_seconds)::BIGINT as total_mem_mb_seconds,
                SUM(job_count)::BIGINT as total_jobs,
                period_start
         FROM usage
@@ -917,12 +924,81 @@ pub async fn get_usage(
             account: row.get("account"),
             cpu_seconds: row.get::<i64, _>("total_cpu_seconds"),
             gpu_seconds: row.get::<i64, _>("total_gpu_seconds"),
+            mem_mb_seconds: row.get::<i64, _>("total_mem_mb_seconds"),
             job_count: row.get::<i64, _>("total_jobs") as u64,
             period_start: row.get("period_start"),
         })
         .collect();
 
     Ok(records)
+}
+
+/// Modify usage for a user+account or an entire account. When `user` is empty,
+/// atomically resets ALL users under that account so the account-level total
+/// stays consistent with the per-user breakdown.
+///
+/// `raw_usage == 0` deletes all matching rows (Slurm parity). A positive value
+/// replaces usage with a single synthetic row. A negative value subtracts from
+/// the current total (clamped at 0). Returns the previous total for audit logging.
+pub async fn modify_usage(
+    pool: &PgPool,
+    user: &str,
+    account: &str,
+    raw_usage: i64,
+) -> anyhow::Result<i64> {
+    let prev: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(cpu_seconds + gpu_seconds), 0)::BIGINT FROM usage WHERE ($1 = '' OR user_name = $1) AND account = $2",
+    )
+    .bind(user)
+    .bind(account)
+    .fetch_one(pool)
+    .await?;
+
+    sqlx::query("DELETE FROM usage WHERE ($1 = '' OR user_name = $1) AND account = $2")
+        .bind(user)
+        .bind(account)
+        .execute(pool)
+        .await?;
+
+    let new_value = if raw_usage < 0 {
+        (prev + raw_usage).max(0)
+    } else {
+        raw_usage
+    };
+
+    if new_value > 0 {
+        let now = Utc::now();
+        let period_start = now
+            .date_naive()
+            .and_hms_opt(now.hour(), 0, 0)
+            .unwrap()
+            .and_utc();
+        let period_end = period_start + chrono::Duration::hours(1);
+
+        sqlx::query(
+            r#"
+            INSERT INTO usage (user_name, account, period_start, period_end, cpu_seconds, gpu_seconds, job_count)
+            VALUES ($1, $2, $3, $4, $5, 0, 0)
+            "#,
+        )
+        .bind(user)
+        .bind(account)
+        .bind(period_start)
+        .bind(period_end)
+        .bind(new_value)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(prev)
+}
+
+/// Reset all usage cluster-wide. Used by `usage_reset_period`.
+pub async fn reset_all_usage(pool: &PgPool) -> anyhow::Result<u64> {
+    let res = sqlx::query("DELETE FROM usage")
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
 }
 
 // A macro rather than a `const` so the EXPLAIN test can build its statement with
@@ -984,6 +1060,7 @@ pub struct UsageRecord {
     pub account: String,
     pub cpu_seconds: i64,
     pub gpu_seconds: i64,
+    pub mem_mb_seconds: i64,
     pub job_count: u64,
     pub period_start: DateTime<Utc>,
 }

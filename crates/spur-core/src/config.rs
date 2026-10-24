@@ -680,6 +680,131 @@ pub struct SchedulerConfig {
     /// factor above cannot do because it scales with the team's own quota.
     #[serde(default)]
     pub idle_fill_max_cluster_fraction: f64,
+    /// TRES billing weights for fairshare usage computation, in the format
+    /// `"CPU=<w>,GRES/gpu=<w>"`.  Omitted weights default to 1.0.  Set
+    /// `CPU=0.0,GRES/gpu=1.0` for GPU-only billing on a GPU cluster.
+    #[serde(default)]
+    pub tres_billing_weights: String,
+    /// Periodic cluster-wide usage reset (Slurm `PriorityUsageResetPeriod`).
+    /// Valid: "none" (default), "daily", "weekly", "monthly", "quarterly", "yearly".
+    #[serde(default)]
+    pub usage_reset_period: UsageResetPeriod,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UsageResetPeriod {
+    #[default]
+    None,
+    Daily,
+    Weekly,
+    Monthly,
+    Quarterly,
+    Yearly,
+}
+
+impl UsageResetPeriod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+            Self::Quarterly => "quarterly",
+            Self::Yearly => "yearly",
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for UsageResetPeriod {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "" | "none" => Ok(Self::None),
+            "daily" => Ok(Self::Daily),
+            "weekly" => Ok(Self::Weekly),
+            "monthly" => Ok(Self::Monthly),
+            "quarterly" => Ok(Self::Quarterly),
+            "yearly" => Ok(Self::Yearly),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown usage_reset_period '{other}', expected none/daily/weekly/monthly/quarterly/yearly"
+            ))),
+        }
+    }
+}
+
+impl serde::Serialize for UsageResetPeriod {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Parsed TRES billing weights for fairshare computation.
+#[derive(Debug, Clone, Copy)]
+pub struct BillingWeights {
+    pub cpu: f64,
+    pub gpu: f64,
+    pub mem: f64,
+}
+
+impl Default for BillingWeights {
+    fn default() -> Self {
+        Self {
+            cpu: 1.0,
+            gpu: 1.0,
+            mem: 0.0,
+        }
+    }
+}
+
+impl BillingWeights {
+    /// Parse Slurm-style `TRESBillingWeights` string, e.g.
+    /// `"CPU=0.0,Mem=0.25G,GRES/gpu=1.0"`.  Unknown keys are silently ignored
+    /// (forward-compatible with future TRES types).  Omitted keys keep their
+    /// default.  An empty string yields the default weights.
+    ///
+    /// Slurm's `Mem` unit is per-GiB: `Mem=0.25G` means 0.25 billing units
+    /// per GiB per second.  The `G` suffix is stripped; the raw float is
+    /// stored as-is (the caller's mem_mb_seconds is already in MB, so the
+    /// billing function converts).
+    pub fn parse(s: &str) -> Self {
+        let mut w = Self::default();
+        for token in s.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let Some((key, val)) = token.split_once('=') else {
+                continue;
+            };
+            let key = key.trim().to_ascii_uppercase();
+            let val = val.trim().trim_end_matches('G').trim_end_matches('g');
+            let Ok(v) = val.parse::<f64>() else {
+                continue;
+            };
+            match key.as_str() {
+                "CPU" => w.cpu = v.max(0.0),
+                "GRES/GPU" => w.gpu = v.max(0.0),
+                "MEM" => w.mem = v.max(0.0),
+                _ => {}
+            }
+        }
+        w
+    }
+
+    /// Compute the weighted billing value from raw CPU, GPU, and memory seconds.
+    /// `mem_mb_seconds` is in MB-seconds; Slurm's `Mem` weight is per-GiB, so
+    /// we divide by 1024 to convert.
+    pub fn bill(&self, cpu_seconds: i64, gpu_seconds: i64, mem_mb_seconds: i64) -> f64 {
+        self.cpu * cpu_seconds as f64
+            + self.gpu * gpu_seconds as f64
+            + self.mem * (mem_mb_seconds as f64 / 1024.0)
+    }
 }
 
 /// How often an interactive client (`salloc`/`srun`) pings the controller to
@@ -728,7 +853,15 @@ impl Default for SchedulerConfig {
             idle_fill_exempt_secs: default_idle_fill_exempt_secs(),
             idle_fill_max_borrow_factor: 0.0,
             idle_fill_max_cluster_fraction: 0.0,
+            tres_billing_weights: String::new(),
+            usage_reset_period: UsageResetPeriod::None,
         }
+    }
+}
+
+impl SchedulerConfig {
+    pub fn billing_weights(&self) -> BillingWeights {
+        BillingWeights::parse(&self.tres_billing_weights)
     }
 }
 
@@ -5042,5 +5175,139 @@ memlock = "inherit"
             config.rlimits.memlock_limit().unwrap(),
             MemlockLimit::Inherit
         );
+    }
+
+    #[test]
+    fn billing_weights_default_is_one_to_one() {
+        let w = BillingWeights::default();
+        assert_eq!(w.cpu, 1.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_gpu_only() {
+        let w = BillingWeights::parse("CPU=0.0,GRES/gpu=1.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_mixed() {
+        let w = BillingWeights::parse("CPU=0.5, GRES/gpu=2.0");
+        assert_eq!(w.cpu, 0.5);
+        assert_eq!(w.gpu, 2.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_empty_is_default() {
+        let w = BillingWeights::parse("");
+        assert_eq!(w.cpu, 1.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_case_insensitive() {
+        let w = BillingWeights::parse("cpu=0.0,gres/GPU=3.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 3.0);
+    }
+
+    #[test]
+    fn billing_weights_parse_ignores_unknown_keys() {
+        let w = BillingWeights::parse("CPU=0.0,Mem=0.5,GRES/gpu=1.0,GRES/nic=2.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 1.0);
+        assert_eq!(w.mem, 0.5);
+    }
+
+    #[test]
+    fn billing_weights_parse_mem_with_g_suffix() {
+        let w = BillingWeights::parse("CPU=1.0,Mem=0.25G,GRES/gpu=16.0");
+        assert_eq!(w.cpu, 1.0);
+        assert_eq!(w.gpu, 16.0);
+        assert_eq!(w.mem, 0.25);
+    }
+
+    #[test]
+    fn billing_weights_parse_clamps_negative_to_zero() {
+        let w = BillingWeights::parse("CPU=-5.0,GRES/gpu=-1.0,Mem=-1.0");
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 0.0);
+        assert_eq!(w.mem, 0.0);
+    }
+
+    #[test]
+    fn billing_weights_bill_applies_weights() {
+        let w = BillingWeights::parse("CPU=0.0,GRES/gpu=1.0");
+        assert_eq!(w.bill(20_390_400, 691_200, 0), 691_200.0);
+        assert_eq!(w.bill(172_800, 691_200, 0), 691_200.0);
+    }
+
+    #[test]
+    fn billing_weights_bill_includes_memory() {
+        let w = BillingWeights::parse("CPU=1.0,Mem=0.5G,GRES/gpu=0.0");
+        // 100 cpu-seconds + 0 gpu-seconds + 2048 MB-seconds (= 2 GiB-seconds * 0.5)
+        let bill = w.bill(100, 0, 2048);
+        assert_eq!(bill, 100.0 + 0.5 * (2048.0 / 1024.0));
+    }
+
+    #[test]
+    fn billing_weights_bill_default_sums_cpu_gpu_only() {
+        let w = BillingWeights::default();
+        assert_eq!(w.mem, 0.0);
+        assert_eq!(w.bill(100, 200, 5000), 300.0);
+    }
+
+    #[test]
+    fn scheduler_config_billing_weights_accessor() {
+        let toml = r#"
+cluster_name = "test"
+
+[scheduler]
+tres_billing_weights = "CPU=0.0,GRES/gpu=1.0"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        let w = config.scheduler.billing_weights();
+        assert_eq!(w.cpu, 0.0);
+        assert_eq!(w.gpu, 1.0);
+    }
+
+    #[test]
+    fn usage_reset_period_default_is_none() {
+        let toml = r#"cluster_name = "test""#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.scheduler.usage_reset_period, UsageResetPeriod::None);
+    }
+
+    #[test]
+    fn usage_reset_period_parses_all_variants() {
+        for (input, expected) in [
+            ("daily", UsageResetPeriod::Daily),
+            ("weekly", UsageResetPeriod::Weekly),
+            ("monthly", UsageResetPeriod::Monthly),
+            ("quarterly", UsageResetPeriod::Quarterly),
+            ("yearly", UsageResetPeriod::Yearly),
+            ("MONTHLY", UsageResetPeriod::Monthly),
+            ("none", UsageResetPeriod::None),
+        ] {
+            let toml = format!(
+                "cluster_name = \"test\"\n[scheduler]\nusage_reset_period = \"{input}\""
+            );
+            let config = SlurmConfig::load_from_str(&toml).unwrap();
+            assert_eq!(
+                config.scheduler.usage_reset_period, expected,
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_reset_period_rejects_invalid() {
+        let toml = r#"
+cluster_name = "test"
+[scheduler]
+usage_reset_period = "biweekly"
+"#;
+        assert!(SlurmConfig::load_from_str(toml).is_err());
     }
 }

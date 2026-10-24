@@ -566,10 +566,23 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 /// Render `scontrol show config` from a controller ping. The cluster name and
 /// version follow the live controller, not the login node's local config.
 fn format_config(controller: &str, ping: &spur_proto::proto::PingResponse) -> String {
-    format!(
+    let mut out = format!(
         "ClusterName={}\nSlurmctldAddr={}\nVersion={}\n",
         ping.cluster_name, controller, ping.version
-    )
+    );
+    if !ping.tres_billing_weights.is_empty() {
+        out.push_str(&format!(
+            "TRESBillingWeights={}\n",
+            ping.tres_billing_weights
+        ));
+    }
+    if !ping.usage_reset_period.is_empty() && ping.usage_reset_period != "none" {
+        out.push_str(&format!(
+            "UsageResetPeriod={}\n",
+            ping.usage_reset_period
+        ));
+    }
+    out
 }
 
 /// The job's nodelist from the environment: `SLURM_JOB_NODELIST`, else

@@ -161,6 +161,7 @@ struct AccountingInner {
     assoc: parking_lot::RwLock<Option<std::sync::Arc<crate::association_cache::AssociationCache>>>,
     auth: parking_lot::RwLock<spur_core::config::AuthConfig>,
     fairshare_halflife_days: std::sync::atomic::AtomicU32,
+    billing_weights: parking_lot::RwLock<spur_core::config::BillingWeights>,
 }
 
 impl Clone for AccountingService {
@@ -180,6 +181,7 @@ impl AccountingService {
                 assoc: parking_lot::RwLock::new(None),
                 auth: parking_lot::RwLock::new(spur_core::config::AuthConfig::default()),
                 fairshare_halflife_days: std::sync::atomic::AtomicU32::new(0),
+                billing_weights: parking_lot::RwLock::new(spur_core::config::BillingWeights::default()),
             }),
         }
     }
@@ -188,6 +190,14 @@ impl AccountingService {
         self.inner
             .fairshare_halflife_days
             .store(days, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn attach_billing_weights(&self, weights: spur_core::config::BillingWeights) {
+        *self.inner.billing_weights.write() = weights;
+    }
+
+    fn billing_weights(&self) -> spur_core::config::BillingWeights {
+        *self.inner.billing_weights.read()
     }
 
     fn configured_halflife_days(&self) -> u32 {
@@ -547,7 +557,7 @@ impl SlurmAccounting for AccountingService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let mut agg: std::collections::HashMap<(String, String), (f64, f64, u64)> =
+        let mut agg: std::collections::HashMap<(String, String), (f64, f64, f64, u64)> =
             std::collections::HashMap::new();
         for r in &records {
             let e = agg
@@ -555,21 +565,29 @@ impl SlurmAccounting for AccountingService {
                 .or_default();
             e.0 += r.cpu_seconds as f64;
             e.1 += r.gpu_seconds as f64;
-            e.2 += r.job_count;
+            e.2 += r.mem_mb_seconds as f64;
+            e.3 += r.job_count;
         }
 
         let entries = agg
             .into_iter()
-            .map(|((user, account), (cpu, gpu, jobs))| UsageEntry {
+            .map(|((user, account), (cpu, gpu, mem, jobs))| UsageEntry {
                 user,
                 account,
                 cpu_seconds: cpu,
                 gpu_seconds: gpu,
+                mem_mb_seconds: mem,
                 job_count: jobs,
             })
             .collect();
 
-        Ok(Response::new(GetUsageResponse { entries }))
+        let w = self.billing_weights();
+        Ok(Response::new(GetUsageResponse {
+            entries,
+            billing_weight_cpu: w.cpu,
+            billing_weight_gpu: w.gpu,
+            billing_weight_mem: w.mem,
+        }))
     }
 
     // ============================================================
@@ -825,6 +843,44 @@ impl SlurmAccounting for AccountingService {
         Ok(Response::new(()))
     }
 
+    async fn modify_usage(
+        &self,
+        request: Request<ModifyUsageRequest>,
+    ) -> Result<Response<()>, Status> {
+        self.require_admin(&request, "modify usage")?;
+        let audit = crate::audit::InBand::capture(&request, "ModifyUsage");
+        let pool = self.pool()?;
+        let pool = &pool;
+        let req = request.into_inner();
+        if req.user.is_empty() && req.account.is_empty() {
+            return Err(Status::invalid_argument("user or account required"));
+        }
+        let prev = db::modify_usage(pool, &req.user, &req.account, req.raw_usage)
+            .await
+            .map_err(internal)?;
+        let entity_name = if req.user.is_empty() {
+            req.account.clone()
+        } else {
+            format!("{}@{}", req.user, req.account)
+        };
+        let mut tx = pool.begin().await.map_err(internal)?;
+        write_txn_in_band(
+            &mut tx,
+            &audit,
+            Annotation::new(
+                &entity_name,
+                serde_json::json!({
+                    "previous_usage": prev,
+                    "requested_value": req.raw_usage,
+                }),
+            ),
+        )
+        .await?;
+        tx.commit().await.map_err(internal)?;
+        audit.mark_written();
+        Ok(Response::new(()))
+    }
+
     async fn list_users(
         &self,
         request: Request<ListUsersRequest>,
@@ -1057,7 +1113,8 @@ impl SlurmAccounting for AccountingService {
             req.halflife_days
         };
 
-        let raw_factors = super::fairshare_factors(&pool, halflife)
+        let weights = self.billing_weights();
+        let raw_factors = super::fairshare_factors(&pool, halflife, &weights)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -1674,6 +1731,7 @@ mod tests {
                 account: "research".into(),
                 cpu_seconds: 240,
                 gpu_seconds: 0,
+                mem_mb_seconds: 0,
                 job_count: 1,
                 period_start: now,
             },
@@ -1682,12 +1740,13 @@ mod tests {
                 account: "research".into(),
                 cpu_seconds: 480,
                 gpu_seconds: 100,
+                mem_mb_seconds: 0,
                 job_count: 2,
                 period_start: now,
             },
         ];
 
-        let mut agg: std::collections::HashMap<(String, String), (f64, f64, u64)> =
+        let mut agg: std::collections::HashMap<(String, String), (f64, f64, f64, u64)> =
             std::collections::HashMap::new();
         for r in &records {
             let e = agg
@@ -1695,16 +1754,18 @@ mod tests {
                 .or_default();
             e.0 += r.cpu_seconds as f64;
             e.1 += r.gpu_seconds as f64;
-            e.2 += r.job_count;
+            e.2 += r.mem_mb_seconds as f64;
+            e.3 += r.job_count;
         }
 
         let entries: Vec<UsageEntry> = agg
             .into_iter()
-            .map(|((user, account), (cpu, gpu, jobs))| UsageEntry {
+            .map(|((user, account), (cpu, gpu, mem, jobs))| UsageEntry {
                 user,
                 account,
                 cpu_seconds: cpu,
                 gpu_seconds: gpu,
+                mem_mb_seconds: mem,
                 job_count: jobs,
             })
             .collect();
