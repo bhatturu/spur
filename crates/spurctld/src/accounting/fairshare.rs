@@ -95,7 +95,7 @@ pub(super) fn compute_fairshare(
     for (key, user_share) in &user_shares {
         let usage_val = user_usage.get(key).copied().unwrap_or(0.0);
         let factor = if usage_val < epsilon {
-            (*user_share / epsilon).min(FAIRSHARE_CAP)
+            (*user_share / epsilon).max(1.0).min(FAIRSHARE_CAP)
         } else {
             let actual_share = usage_val / total_usage.max(epsilon);
             (user_share / actual_share).min(FAIRSHARE_CAP)
@@ -467,6 +467,76 @@ mod tests {
             cpu / gpu > 5.0,
             "cpu_user factor should be much higher than gpu_user, ratio={:.2}",
             cpu / gpu
+        );
+    }
+
+    #[test]
+    fn test_zero_usage_never_below_tiny_usage() {
+        let now = Utc::now();
+        let mut accounts = vec![make_account("team", None, 1)];
+        for i in 0..19 {
+            accounts.push(make_account(&format!("other{i}"), None, 1));
+        }
+        let mut user_weights = HashMap::new();
+        for i in 0..100 {
+            user_weights.insert((format!("u{i}"), "team".to_string()), 1);
+        }
+        let record = |user: &str, account: &str, secs: i64| UsageRecord {
+            user_name: user.into(),
+            account: account.into(),
+            cpu_seconds: secs,
+            gpu_seconds: 0,
+            job_count: 1,
+            period_start: now - Duration::hours(1),
+        };
+        let usage = vec![
+            record("heavy", "other0", 1_000_000_000),
+            record("u1", "team", 60),
+        ];
+
+        let factors = compute_fairshare(&usage, &accounts, &user_weights, 14, now);
+        let new_user = factors[&("u0".to_string(), "team".to_string())];
+        let sixty_secs = factors[&("u1".to_string(), "team".to_string())];
+        assert!(
+            new_user >= 1.0,
+            "zero-usage user must not be penalized, got {new_user:.4}"
+        );
+        assert!(
+            new_user <= sixty_secs,
+            "zero-usage ({new_user:.4}) should not exceed tiny-usage ({sixty_secs:.4}) \
+             when both hit the cap, but must never be below neutral"
+        );
+    }
+
+    #[test]
+    fn test_zero_usage_proportional_above_epsilon() {
+        let now = Utc::now();
+        // Use many accounts so individual shares land in the 0.001-0.01 range
+        // where proportionality is visible (not capped at 10).
+        let mut accounts = Vec::new();
+        for i in 0..200 {
+            accounts.push(make_account(&format!("acct{i}"), None, 1));
+        }
+        // acct0 gets weight 5, acct1 gets weight 1 — rest are weight 1
+        accounts[0].fairshare_weight = 5;
+
+        let user_weights: HashMap<(String, String), i32> = vec![
+            (("alice".into(), "acct0".into()), 1),
+            (("bob".into(), "acct1".into()), 1),
+        ]
+        .into_iter()
+        .collect();
+
+        let factors = compute_fairshare(&[], &accounts, &user_weights, 14, now);
+        let alice = factors[&("alice".to_string(), "acct0".to_string())];
+        let bob = factors[&("bob".to_string(), "acct1".to_string())];
+        assert!(
+            alice > bob,
+            "user in bigger-share account should get higher factor: alice={alice:.4} bob={bob:.4}"
+        );
+        assert!(
+            alice >= 1.0 && bob >= 1.0,
+            "both zero-usage users must be at least neutral: alice={alice:.4} bob={bob:.4}"
         );
     }
 }
