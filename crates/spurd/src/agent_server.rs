@@ -5143,6 +5143,8 @@ impl SlurmAgent for AgentService {
             cluster_name: String::new(),
             auth_audience: self.auth_audience.clone(),
             auth_epoch: self.auth_epoch,
+            tres_billing_weights: String::new(),
+            usage_reset_period: String::new(),
         }))
     }
 

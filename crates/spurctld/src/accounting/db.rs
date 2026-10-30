@@ -925,6 +925,74 @@ pub async fn get_usage(
     Ok(records)
 }
 
+/// Modify usage for a user+account or an entire account. When `user` is empty,
+/// atomically resets ALL users under that account so the account-level total
+/// stays consistent with the per-user breakdown.
+///
+/// `raw_usage == 0` deletes all matching rows (Slurm parity). A positive value
+/// replaces usage with a single synthetic row. A negative value subtracts from
+/// the current total (clamped at 0). Returns the previous total for audit logging.
+pub async fn modify_usage(
+    pool: &PgPool,
+    user: &str,
+    account: &str,
+    raw_usage: i64,
+) -> anyhow::Result<i64> {
+    let prev: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(cpu_seconds + gpu_seconds), 0)::BIGINT FROM usage WHERE ($1 = '' OR user_name = $1) AND account = $2",
+    )
+    .bind(user)
+    .bind(account)
+    .fetch_one(pool)
+    .await?;
+
+    sqlx::query("DELETE FROM usage WHERE ($1 = '' OR user_name = $1) AND account = $2")
+        .bind(user)
+        .bind(account)
+        .execute(pool)
+        .await?;
+
+    let new_value = if raw_usage < 0 {
+        (prev + raw_usage).max(0)
+    } else {
+        raw_usage
+    };
+
+    if new_value > 0 {
+        let now = Utc::now();
+        let period_start = now
+            .date_naive()
+            .and_hms_opt(now.hour(), 0, 0)
+            .unwrap()
+            .and_utc();
+        let period_end = period_start + chrono::Duration::hours(1);
+
+        sqlx::query(
+            r#"
+            INSERT INTO usage (user_name, account, period_start, period_end, cpu_seconds, gpu_seconds, job_count)
+            VALUES ($1, $2, $3, $4, $5, 0, 0)
+            "#,
+        )
+        .bind(user)
+        .bind(account)
+        .bind(period_start)
+        .bind(period_end)
+        .bind(new_value)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(prev)
+}
+
+/// Reset all usage cluster-wide. Used by `usage_reset_period`.
+pub async fn reset_all_usage(pool: &PgPool) -> anyhow::Result<u64> {
+    let res = sqlx::query("DELETE FROM usage")
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
 // A macro rather than a `const` so the EXPLAIN test can build its statement with
 // `concat!`, which needs a literal on both sides.
 macro_rules! consumed_wall_minutes_sql {
