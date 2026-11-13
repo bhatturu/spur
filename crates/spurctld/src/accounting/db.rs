@@ -5271,4 +5271,78 @@ mod txn_tests {
             .await?;
         Ok(())
     }
+
+    #[sqlx::test]
+    async fn account_round_trips_default_qos() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let pid = std::process::id();
+        let account = format!("spur_acctqos_{pid}");
+
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &account,
+            AccountUpdate {
+                description: Some("d"),
+                default_qos: Some(Some("highprio")),
+                allowed_qos: Some(Some("highprio,normal")),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let got = list_accounts(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.name == account)
+            .expect("account present");
+        assert_eq!(got.default_qos.as_deref(), Some("highprio"));
+        assert_eq!(got.allowed_qos.as_deref(), Some("highprio,normal"));
+
+        // Unrestated QOS fields must be preserved when other fields change.
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &account,
+            AccountUpdate {
+                description: Some("updated"),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let got = list_accounts(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.name == account)
+            .expect("account present");
+        assert_eq!(got.default_qos.as_deref(), Some("highprio"));
+        assert_eq!(got.description, "updated");
+
+        // Explicitly clearing default_qos sets it to NULL.
+        upsert_account(
+            &mut *pool.acquire().await?,
+            &account,
+            AccountUpdate {
+                default_qos: Some(None),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let got = list_accounts(&pool)
+            .await?
+            .into_iter()
+            .find(|a| a.name == account)
+            .expect("account present");
+        assert_eq!(got.default_qos, None);
+        assert_eq!(got.allowed_qos.as_deref(), Some("highprio,normal"));
+
+        sqlx::query("DELETE FROM accounts WHERE name = $1")
+            .bind(&account)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
 }

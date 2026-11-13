@@ -2492,6 +2492,42 @@ mod tests {
         assert_eq!(req.parent_account, None);
         assert_eq!(req.max_running_jobs, None);
         assert_eq!(req.grp_tres, None);
+        assert_eq!(req.default_qos, None);
+        assert_eq!(req.allowed_qos, None);
+    }
+
+    #[test]
+    fn build_modify_account_request_accepts_defaultqos() {
+        let p = parse_params(&[
+            "name=physics".into(),
+            "defaultqos=normal".into(),
+            "qos=normal,burst".into(),
+        ]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.default_qos, Some("normal".into()));
+        assert_eq!(req.allowed_qos, Some("normal,burst".into()));
+    }
+
+    #[test]
+    fn build_modify_account_request_rejects_defaultqos_not_in_allowlist() {
+        let p = parse_params(&[
+            "name=physics".into(),
+            "defaultqos=highprio".into(),
+            "qos=normal,burst".into(),
+        ]);
+        let err = build_modify_account_request(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("must be included in qos"),
+            "expected validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_modify_account_request_defaultqos_alone_is_valid() {
+        let p = parse_params(&["name=physics".into(), "defaultqos=normal".into()]);
+        let req = build_modify_account_request(&p).unwrap();
+        assert_eq!(req.default_qos, Some("normal".into()));
+        assert_eq!(req.allowed_qos, None);
     }
 
     #[test]
