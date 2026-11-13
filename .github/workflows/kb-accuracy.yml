@@ -88,8 +88,10 @@ jobs:
           KB_BASE_REF: origin/main
           KB_HEAD_REF: ${{ github.event.workflow_run.head_sha }}
         run: |
-          rc=0; scripts/check-kb-accuracy.sh 2>&1 | tee "$RUNNER_TEMP/kb-output.txt" || rc=${PIPESTATUS[0]}
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # Default shell has no pipefail: take the checker's rc, not tee's.
+          set +e
+          scripts/check-kb-accuracy.sh 2>&1 | tee "$RUNNER_TEMP/kb-output.txt"
+          echo "rc=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
       # rc: 0 pass, 1 contradictions, 2 could not run (not a gate); anything else = job error.
       # Statuses have no neutral: rc 2 and job errors report success so they don't gate.
