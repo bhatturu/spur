@@ -5,14 +5,17 @@ name: KB Accuracy Trigger
 on:
   pull_request:
     branches: [main]
-    types: [labeled]
+    types: [labeled, synchronize, reopened]
 
 permissions: {}
 
 jobs:
   trigger:
     name: KB Accuracy Trigger
-    if: github.event.label.name == 'kb-check'
+    # labeled: only the kb-check label itself; synchronize/reopened: any PR carrying it.
+    if: >-
+      (github.event.action == 'labeled' && github.event.label.name == 'kb-check') ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'kb-check'))
     runs-on: ubuntu-latest
     steps:
       - run: echo "kb-check requested"
