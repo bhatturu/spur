@@ -171,6 +171,8 @@ ALTER TABLE qos ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS flags TEXT NOT NULL DEFAULT '';
 ALTER TABLE associations ADD COLUMN IF NOT EXISTS grp_submit_jobs INTEGER;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS grp_tres TEXT;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS default_qos TEXT;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS allowed_qos TEXT;
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt TEXT NOT NULL DEFAULT '';
 ALTER TABLE qos ALTER COLUMN preempt_mode SET DEFAULT '';
 ALTER TABLE qos ADD COLUMN IF NOT EXISTS preempt_exempt_time INTEGER;
@@ -1597,6 +1599,8 @@ pub struct AccountUpdate<'a> {
     pub fairshare: Option<i32>,
     pub max_running_jobs: Option<Option<i32>>,
     pub grp_tres: Option<Option<&'a str>>,
+    pub default_qos: Option<Option<&'a str>>,
+    pub allowed_qos: Option<Option<&'a str>>,
 }
 
 /// Create or update an account, writing only the fields set in `u`. `modify`
@@ -1626,6 +1630,12 @@ pub async fn upsert_account<'a>(
     }
     if let Some(v) = u.grp_tres {
         updates.push(("grp_tres", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.default_qos {
+        updates.push(("default_qos", SqlVal::NullText(v)));
+    }
+    if let Some(v) = u.allowed_qos {
+        updates.push(("allowed_qos", SqlVal::NullText(v)));
     }
     upsert_row(conn, UpsertTable::Accounts, &keys, &updates).await
 }
@@ -1688,7 +1698,9 @@ pub async fn list_coordinators(pool: &PgPool) -> anyhow::Result<Vec<(String, Str
 /// List all accounts.
 pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, organization, parent_account, fairshare_weight, max_running_jobs, grp_tres FROM accounts ORDER BY name"
+        "SELECT name, description, organization, parent_account, fairshare_weight, \
+         max_running_jobs, grp_tres, default_qos, allowed_qos \
+         FROM accounts ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -1701,6 +1713,8 @@ pub async fn list_accounts(pool: &PgPool) -> anyhow::Result<Vec<AccountRecord>> 
             fairshare_weight: r.get("fairshare_weight"),
             max_running_jobs: r.get("max_running_jobs"),
             grp_tres: r.get("grp_tres"),
+            default_qos: r.get("default_qos"),
+            allowed_qos: r.get("allowed_qos"),
         })
         .collect())
 }
@@ -1713,8 +1727,9 @@ pub struct AccountRecord {
     pub parent: Option<String>,
     pub fairshare_weight: i32,
     pub max_running_jobs: Option<i32>,
-    /// Account resource allocation as a TRES string; None = unlimited.
     pub grp_tres: Option<String>,
+    pub default_qos: Option<String>,
+    pub allowed_qos: Option<String>,
 }
 
 /// Update the partition-less association's columns, inserting the row if none

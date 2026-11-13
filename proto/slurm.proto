@@ -1956,6 +1956,8 @@ message CreateAccountRequest {
   // to no-limit; any other value (including a literal 0) is stored as-is.
   optional uint32 max_running_jobs = 6;
   optional string grp_tres = 7;
+  optional string default_qos = 8;
+  optional string allowed_qos = 9;
 }
 
 message DeleteAccountRequest {
@@ -1985,6 +1987,8 @@ message AccountInfo {
   double fairshare_weight = 5;
   uint32 max_running_jobs = 6;
   string grp_tres = 7;
+  string default_qos = 8;
+  string allowed_qos = 9;
 }
 
 // Add or modify a user-account association (proto3 presence: unset = leave

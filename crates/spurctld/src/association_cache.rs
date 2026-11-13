@@ -21,6 +21,8 @@ struct Snapshot {
     allowed_qos: HashMap<(String, String), HashSet<String>>,
     admin_level: HashMap<String, String>,
     coordinators: HashSet<(String, String)>,
+    account_default_qos: HashMap<String, String>,
+    account_allowed_qos: HashMap<String, HashSet<String>>,
     loaded: bool,
 }
 
@@ -82,16 +84,7 @@ pub(crate) fn with_sub_accounts(
 impl AssociationCache {
     pub fn new() -> Self {
         Self {
-            snapshot: RwLock::new(Snapshot {
-                default_qos: HashMap::new(),
-                default_account: HashMap::new(),
-                memberships: HashSet::new(),
-                limits: HashMap::new(),
-                allowed_qos: HashMap::new(),
-                admin_level: HashMap::new(),
-                coordinators: HashSet::new(),
-                loaded: false,
-            }),
+            snapshot: RwLock::new(Snapshot::default()),
             kick: Notify::new(),
         }
     }
@@ -206,8 +199,15 @@ impl AssociationCache {
             ));
         }
         let empty = HashSet::new();
-        let allowed = snapshot.allowed_qos.get(&key).unwrap_or(&empty);
-        let default = snapshot.default_qos.get(&key);
+        let allowed = snapshot
+            .allowed_qos
+            .get(&key)
+            .or_else(|| snapshot.account_allowed_qos.get(account))
+            .unwrap_or(&empty);
+        let default = snapshot
+            .default_qos
+            .get(&key)
+            .or_else(|| snapshot.account_default_qos.get(account));
         if qos_permitted(allowed, default.map(String::as_str), qos) {
             Ok(())
         } else {
@@ -242,11 +242,17 @@ impl AssociationCache {
                 .default_qos
                 .get(&(user.to_owned(), acct.clone()))
                 .cloned()
+                .or_else(|| snapshot.account_default_qos.get(acct).cloned())
         });
         let allowed_qos = effective_account
             .as_ref()
-            .and_then(|acct| snapshot.allowed_qos.get(&(user.to_owned(), acct.clone())))
-            .cloned()
+            .and_then(|acct| {
+                snapshot
+                    .allowed_qos
+                    .get(&(user.to_owned(), acct.clone()))
+                    .cloned()
+                    .or_else(|| snapshot.account_allowed_qos.get(acct).cloned())
+            })
             .unwrap_or_default();
         (effective_account, default_qos, allowed_qos)
     }
@@ -390,6 +396,8 @@ impl AssociationCache {
                     allowed_qos,
                     admin_level,
                     coordinators,
+                    acct_default_qos,
+                    acct_allowed_qos,
                 ))) => {
                     info!(
                         default_qos = qos.len(),
@@ -399,6 +407,8 @@ impl AssociationCache {
                         allowed_qos = allowed_qos.len(),
                         admin_level = admin_level.len(),
                         coordinators = coordinators.len(),
+                        account_default_qos = acct_default_qos.len(),
+                        account_allowed_qos = acct_allowed_qos.len(),
                         "association cache initialized"
                     );
                     cache.replace(Snapshot {
@@ -409,6 +419,8 @@ impl AssociationCache {
                         allowed_qos,
                         admin_level,
                         coordinators,
+                        account_default_qos: acct_default_qos,
+                        account_allowed_qos: acct_allowed_qos,
                         loaded: true,
                     });
                 }
@@ -440,6 +452,8 @@ impl AssociationCache {
                         allowed_qos,
                         admin_level,
                         coordinators,
+                        acct_default_qos,
+                        acct_allowed_qos,
                     ))) => cache.replace(Snapshot {
                         default_qos: qos,
                         default_account: accounts,
@@ -448,6 +462,8 @@ impl AssociationCache {
                         allowed_qos,
                         admin_level,
                         coordinators,
+                        account_default_qos: acct_default_qos,
+                        account_allowed_qos: acct_allowed_qos,
                         loaded: true,
                     }),
                     Ok(Err(e)) => {

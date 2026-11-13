@@ -378,6 +378,8 @@ pub async fn association_maps(
     HashMap<(String, String), HashSet<String>>,
     HashMap<String, String>,
     HashSet<(String, String)>,
+    HashMap<String, String>,
+    HashMap<String, HashSet<String>>,
 )> {
     let users = db::list_users(pool, None, None).await?;
 
@@ -418,17 +420,29 @@ pub async fn association_maps(
         })
         .collect();
 
-    let parent_of: HashMap<String, String> = db::list_accounts(pool)
-        .await?
-        .into_iter()
-        .filter_map(|account| {
-            account
-                .parent
-                .filter(|parent| !parent.is_empty())
-                .map(|parent| (account.name, parent))
-        })
-        .collect();
-    // Stored expanded, so every read sees sub-accounts without walking the tree.
+    let account_records = db::list_accounts(pool).await?;
+    let mut account_default_qos = HashMap::new();
+    let mut account_allowed_qos = HashMap::new();
+    let mut parent_of: HashMap<String, String> = HashMap::new();
+    for account in &account_records {
+        if let Some(parent) = account.parent.as_ref().filter(|p| !p.is_empty()) {
+            parent_of.insert(account.name.clone(), parent.clone());
+        }
+        if let Some(dq) = &account.default_qos {
+            account_default_qos.insert(account.name.clone(), dq.clone());
+        }
+        if let Some(aq) = &account.allowed_qos {
+            let set: HashSet<String> = aq
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            if !set.is_empty() {
+                account_allowed_qos.insert(account.name.clone(), set);
+            }
+        }
+    }
     let coordinators =
         crate::association_cache::with_sub_accounts(db::list_coordinators(pool).await?, &parent_of);
 
@@ -440,6 +454,8 @@ pub async fn association_maps(
         allowed_qos,
         admin_level,
         coordinators,
+        account_default_qos,
+        account_allowed_qos,
     ))
 }
 
