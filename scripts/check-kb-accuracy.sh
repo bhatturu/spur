@@ -122,12 +122,12 @@ Rules:
 - Do NOT flag style, formatting, or wording preferences.
 - Each contradiction must cite the specific doc file, the specific claim, and the specific code change that contradicts it.
 
-CRITICAL: Your response MUST begin with exactly PASS or FAIL as the very first word on the very first line. No preamble, no analysis before the verdict, no "I'll analyze..." or "Let me check..." — just the verdict first.
+First, analyze: for each behavioral change in the diff, find any KB claim about that same code path and decide whether the change makes it false. Keep the analysis concise.
 
-If you find NO contradictions, your entire response must be exactly: PASS
-
-If you find contradictions, respond with FAIL on the first line, then list each contradiction as:
+Then, if you found contradictions, list each as:
 - [file.md:line-area] "quoted claim" — contradicted by: explanation of what the code actually does
+
+The LAST line of your response must be exactly VERDICT: PASS or VERDICT: FAIL.
 
 --- CODE DIFF ---
 {diff_text}
@@ -137,8 +137,8 @@ If you find contradictions, respond with FAIL on the first line, then list each 
 
 body = json.dumps({
     "model": model,
-    "max_tokens": 4096,
-    "system": "You are a CI checker that outputs structured verdicts. Your response MUST start with PASS or FAIL on the first line. Never add preamble.",
+    "max_tokens": 8192,
+    "system": "You are a CI checker. End your response with a final line VERDICT: PASS or VERDICT: FAIL.",
     "messages": [{"role": "user", "content": prompt}],
 }).encode()
 
@@ -178,19 +178,19 @@ print()
 print(f"=== Knowledge Base Accuracy Check (model: {served_model}) ===")
 print()
 
-verdict = result.strip().split("\n", 1)[0].strip() if result.strip() else ""
+last = result.strip().rsplit("\n", 1)[-1].strip() if result.strip() else ""
 
-if verdict == "PASS":
+if last == "VERDICT: PASS":
     print("PASS — no contradictions found")
     sys.exit(0)
-elif verdict == "FAIL":
+elif last == "VERDICT: FAIL":
     print(result)
     print()
     print("Knowledge base has claims that contradict the code changes.")
     print("Update the relevant AGENTS.md or docs/knowledge/ files.")
     sys.exit(1)
 else:
-    print(f"Unexpected LLM verdict (first line: {verdict!r}) — treating as inconclusive")
+    print(f"Unexpected LLM verdict (last line: {last!r}) — treating as inconclusive")
     print(result[:500])
     sys.exit(2)
 PYEOF
