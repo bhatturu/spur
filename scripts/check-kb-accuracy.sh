@@ -19,9 +19,9 @@
 #   KB_BASE_REF        — base ref for the diff (default: origin/main)
 #   KB_HEAD_REF        — head ref for the diff (default: HEAD). When not HEAD,
 #                        KB docs are read from this ref via git, not the tree.
-#   KB_MAX_DIFF_CHARS  — skip if diff is too large (default: 80000)
+#   KB_MAX_DIFF_CHARS  — skip if diff is too large (default: 200000)
 #   KB_MAX_TOTAL_CHARS — skip if diff + KB is too large (default: 500000)
-#   KB_API_TIMEOUT     — LLM API timeout in seconds (default: 120)
+#   KB_API_TIMEOUT     — LLM API timeout in seconds (default: 300)
 #   Empty values fall back to the default (unset CI repo variables expand to "").
 #
 # Usage:
@@ -36,9 +36,9 @@ cd "$REPO_ROOT"
 BASE_REF="${KB_BASE_REF:-origin/main}"
 HEAD_REF="${KB_HEAD_REF:-HEAD}"
 MODEL="${KB_MODEL:-Claude-Opus-4.8}"
-MAX_DIFF_CHARS="${KB_MAX_DIFF_CHARS:-80000}"
+MAX_DIFF_CHARS="${KB_MAX_DIFF_CHARS:-200000}"
 MAX_TOTAL_CHARS="${KB_MAX_TOTAL_CHARS:-500000}"
-API_TIMEOUT="${KB_API_TIMEOUT:-120}"
+API_TIMEOUT="${KB_API_TIMEOUT:-300}"
 API_URL="${KB_API_URL:-https://llm-api.amd.com/Anthropic/v1/messages}"
 API_KEY="${KB_API_KEY:-}"
 
