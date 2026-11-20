@@ -20,6 +20,9 @@
 #   KB_HEAD_REF        — head ref for the diff (default: HEAD). When not HEAD,
 #                        KB docs are read from this ref via git, not the tree.
 #   KB_MAX_DIFF_CHARS  — skip if diff is too large (default: 80000)
+#   KB_MAX_TOTAL_CHARS — skip if diff + KB is too large (default: 500000)
+#   KB_API_TIMEOUT     — LLM API timeout in seconds (default: 120)
+#   Empty values fall back to the default (unset CI repo variables expand to "").
 #
 # Usage:
 #   scripts/check-kb-accuracy.sh              # check current branch vs main
@@ -34,8 +37,18 @@ BASE_REF="${KB_BASE_REF:-origin/main}"
 HEAD_REF="${KB_HEAD_REF:-HEAD}"
 MODEL="${KB_MODEL:-Claude-Opus-4.8}"
 MAX_DIFF_CHARS="${KB_MAX_DIFF_CHARS:-80000}"
+MAX_TOTAL_CHARS="${KB_MAX_TOTAL_CHARS:-500000}"
+API_TIMEOUT="${KB_API_TIMEOUT:-120}"
 API_URL="${KB_API_URL:-https://llm-api.amd.com/Anthropic/v1/messages}"
 API_KEY="${KB_API_KEY:-}"
+
+# A non-integer makes `[ -gt ]` false inside `if`, silently disabling the limit.
+for knob in "KB_MAX_DIFF_CHARS=$MAX_DIFF_CHARS" "KB_MAX_TOTAL_CHARS=$MAX_TOTAL_CHARS" "KB_API_TIMEOUT=$API_TIMEOUT"; do
+    if ! [[ "${knob#*=}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "::error::${knob%%=*} must be a positive integer, got '${knob#*=}'"
+        exit 2
+    fi
+done
 
 if [ -z "$API_KEY" ]; then
     echo "::error::KB_API_KEY not set — cannot run accuracy check"
@@ -94,15 +107,16 @@ done
 
 kb_chars=$(wc -c < "$tmpdir/kb.txt")
 total_chars=$((diff_chars + kb_chars))
-if [ "$total_chars" -gt 500000 ]; then
-    echo "::warning::Combined context too large (${total_chars} chars) — accuracy check not run"
+if [ "$total_chars" -gt "$MAX_TOTAL_CHARS" ]; then
+    echo "::warning::Combined context too large (${total_chars} chars > ${MAX_TOTAL_CHARS}) — accuracy check not run"
     exit 2
 fi
 
-python3 - "$tmpdir" "$MODEL" "$API_KEY" "$API_URL" <<'PYEOF'
+python3 - "$tmpdir" "$MODEL" "$API_KEY" "$API_URL" "$API_TIMEOUT" <<'PYEOF'
 import sys, json, urllib.request, urllib.error, os
 
 tmpdir, model, api_key, api_url = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+api_timeout = int(sys.argv[5])
 
 with open(os.path.join(tmpdir, "diff.txt")) as f:
     diff_text = f.read()
@@ -153,7 +167,7 @@ headers = {
 req = urllib.request.Request(api_url, data=body, headers=headers)
 
 try:
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=api_timeout) as resp:
         data = json.load(resp)
 except urllib.error.HTTPError as e:
     print(f"LLM API returned HTTP {e.code}")

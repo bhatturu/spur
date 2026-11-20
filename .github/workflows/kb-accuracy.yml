@@ -87,6 +87,11 @@ jobs:
           KB_API_KEY: ${{ secrets.KB_API_KEY }}
           KB_BASE_REF: origin/main
           KB_HEAD_REF: ${{ github.event.workflow_run.head_sha }}
+          # Optional repo variables; unset expands to "" and the script default applies.
+          KB_MODEL: ${{ vars.KB_MODEL }}
+          KB_MAX_DIFF_CHARS: ${{ vars.KB_MAX_DIFF_CHARS }}
+          KB_MAX_TOTAL_CHARS: ${{ vars.KB_MAX_TOTAL_CHARS }}
+          KB_API_TIMEOUT: ${{ vars.KB_API_TIMEOUT }}
         run: |
           # Default shell has no pipefail: take the checker's rc, not tee's.
           set +e
